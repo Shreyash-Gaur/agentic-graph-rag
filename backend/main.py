@@ -219,19 +219,27 @@ def query_endpoint(req: QueryRequest):
         raise HTTPException(status_code=503, detail="RAG Agent not initialized")
 
     try:
+        # 1. Retrieve History (If memory service exists)
+        chat_history = ""
+        session_id = getattr(req, "session_id", "default_session")
+        
+        if memory_service:
+            chat_history = memory_service.get_context(session_id, last_n=10)
+
         # Determine mode
         mode = "detailed" if req.max_tokens > 512 else "concise"
         
+        # 2. Pass History to Agent
         output = rag_agent.query(
             query=req.query, 
             mode=mode, 
-            temperature=req.temperature
+            temperature=req.temperature,
+            chat_history=chat_history  
         )
         answer_text = output.get("answer", "No answer generated.")
 
+        # 3. Save New Turn (After generating answer)
         if memory_service:
-            session_id = getattr(req, "session_id", "default_session")
-            
             try:
                 memory_service.add_turn(
                     session_id=session_id,
@@ -244,7 +252,7 @@ def query_endpoint(req: QueryRequest):
 
         return QueryResponse(
             query=req.query,
-            answer=output.get("answer", "No answer generated."),
+            answer=answer_text,
             sources=[], 
             num_sources=0,
             prompt="",

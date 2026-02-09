@@ -1,4 +1,4 @@
-from typing import TypedDict, List
+from typing import TypedDict, List, Optional
 from langchain_core.messages import HumanMessage
 from langchain_ollama import ChatOllama
 from langgraph.graph import StateGraph, END
@@ -8,6 +8,7 @@ import json
 class AgentState(TypedDict):
     question: str
     original_question: str
+    chat_history: str  
     documents: List[str]
     decision: str
     generation: str
@@ -18,7 +19,7 @@ class AgentState(TypedDict):
 
 # --- THE AGENT CLASS ---
 class GraphRAGAgent:
-    def __init__(self, retrieve_service, model_name="mistral"):
+    def __init__(self, retrieve_service, model_name="qwen2.5:7b"):
         self.retrieve_service = retrieve_service
         self.model_name = model_name 
         
@@ -50,7 +51,14 @@ class GraphRAGAgent:
         return {"decision": decision, "steps": ["router"]}
 
     def general_conversation(self, state: AgentState):
-        prompt = f"Reply politely: {state['original_question']}"
+        # NEW: Inject history into chitchat
+        prompt = f"""
+        Previous Chat History:
+        {state.get('chat_history', '')}
+        
+        User: {state['original_question']}
+        Reply politely and conversationally."""
+        
         writer = ChatOllama(model=self.model_name, temperature=state["temperature"])
         res = writer.invoke([HumanMessage(content=prompt)]).content
         return {"generation": res, "steps": ["general_conversation"]}
@@ -95,7 +103,14 @@ class GraphRAGAgent:
 
     def transform_query(self, state: AgentState):
         print("---TRANSFORMING QUERY---")
-        prompt = f"Rewrite search query for: {state['question']}. Output ONLY string."
+        # NEW: Transform considering history (e.g., "He" -> "Amico")
+        prompt = f"""
+        Context: {state.get('chat_history', '')}
+        User Question: {state['question']}
+        
+        Rewrite the user question to be standalone and search-friendly. Replace pronouns (he/she/it) with specific names from context if possible.
+        Output ONLY the string."""
+        
         new_q = self.llm.invoke([HumanMessage(content=prompt)]).content.strip()
         return {"question": new_q, "retry_count": state["retry_count"]+1}
 
@@ -103,8 +118,8 @@ class GraphRAGAgent:
         print(f"---GENERATING ({state['mode'].upper()} | Temp: {state['temperature']})---")
         question = state["original_question"]
         context = "\n\n".join(state["documents"])
+        history = state.get("chat_history", "") # <--- Get history
         
-        # DYNAMIC PROMPTING
         if state["mode"] == "detailed":
             system_prompt = "You are a comprehensive analyst. Write a detailed, in-depth response. Minimum 300 words."
         else:
@@ -112,10 +127,14 @@ class GraphRAGAgent:
 
         writer = ChatOllama(model=self.model_name, temperature=state["temperature"])
 
+        # NEW: Inject History into Prompt
         prompt = f"""{system_prompt}
         
         Relevant Context (may include Knowledge Graph relationships):
         {context}
+        
+        Chat History:
+        {history}
         
         Question: {question}
         Answer:"""
@@ -127,7 +146,6 @@ class GraphRAGAgent:
     def route_decision(self, state): return state["decision"]
     
     def decide_to_generate(self, state):
-        # If no docs found, try transforming query up to max_retries
         if not state["documents"]:
             return "generate" if state["retry_count"] >= self.max_retries else "transform_query"
         return "generate"
@@ -150,12 +168,13 @@ class GraphRAGAgent:
         workflow.add_edge("generate", END)
         return workflow.compile()
 
-    def query(self, query: str, mode: str = "concise", temperature: float = 0.1):
-        """Entry point that accepts mode and temperature."""
+    def query(self, query: str, mode: str = "concise", temperature: float = 0.1, chat_history: str = ""):
+        """Entry point that accepts mode, temperature, and chat_history."""
         app = self.build_graph()
         initial = {
             "question": query,
             "original_question": query,
+            "chat_history": chat_history,
             "documents": [],
             "decision": "vectorstore",
             "retry_count": 0,
