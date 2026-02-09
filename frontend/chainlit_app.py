@@ -27,7 +27,7 @@ def backend_query(query: str, top_k: int = 5, max_tokens: int = 512, temperature
         "temperature": temperature
     }
     try:
-        response = requests.post(url, json=payload, timeout=60)
+        response = requests.post(url, json=payload, timeout=150)
         response.raise_for_status()
         return response.json()
     except Exception as e:
