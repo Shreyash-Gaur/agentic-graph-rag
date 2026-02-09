@@ -36,7 +36,7 @@ class Settings(BaseSettings):
 
     # Ollama / Embedding (your chosen defaults)
     OLLAMA_BASE_URL: str = "http://localhost:11434"
-    OLLAMA_MODEL: str = "mistral:latest"
+    OLLAMA_MODEL: str = "qwen2.5:7b"
     EMBEDDING_MODEL: str = "nomic-embed-text"
 
     # RAG Behavior

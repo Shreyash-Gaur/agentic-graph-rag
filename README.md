@@ -57,7 +57,7 @@ The system runs on a **dual-pipeline** architecture:
 
 ## 🛠️ Tech Stack
 
-* **LLM & Embeddings:** Ollama (Mistral, Llama 3)
+* **LLM & Embeddings:** Ollama (Mistral, qwen2.5, Llama 3)
 * **Orchestration:** LangChain, LangGraph
 * **Graph Database:** Neo4j (Dockerized)
 * **Vector Database:** FAISS (Local Index)
