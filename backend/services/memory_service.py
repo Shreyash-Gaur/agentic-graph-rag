@@ -20,7 +20,7 @@ from typing import List, Dict, Optional, Any
 
 logger = logging.getLogger("agentic-rag.memory")
 
-DEFAULT_DB_PATH = "backend/db/memory_store.sqlite"
+DEFAULT_DB_PATH = "backend/db/memory/memory_store.sqlite"
 
 class MemoryService:
     def __init__(

@@ -33,8 +33,8 @@ except ImportError:
 logger = logging.getLogger("agentic-rag.retrieve")
 
 # Default paths (from config if available)
-DEFAULT_INDEX = settings.FAISS_INDEX_PATH if hasattr(settings, "FAISS_INDEX_PATH") else "backend/db/knowledge_faiss.index"
-DEFAULT_META = settings.FAISS_META_PATH if hasattr(settings, "FAISS_META_PATH") else "backend/db/knowledge_meta.jsonl"
+DEFAULT_INDEX = settings.FAISS_INDEX_PATH if hasattr(settings, "FAISS_INDEX_PATH") else "backend/db/vector_data/knowledge_faiss.index"
+DEFAULT_META = settings.FAISS_META_PATH if hasattr(settings, "FAISS_META_PATH") else "backend/db/vector_data/knowledge_meta.jsonl"
 DEFAULT_EMBED_MODEL = settings.EMBEDDING_MODEL if hasattr(settings, "EMBEDDING_MODEL") else "mxbai-embed-large:latest"
 
 

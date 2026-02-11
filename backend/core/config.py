@@ -50,12 +50,12 @@ class Settings(BaseSettings):
     NEO4J_PASSWORD: str = "password"
 
     # Paths
-    FAISS_INDEX_PATH: str = "backend/db/knowledge_faiss.index"
-    FAISS_META_PATH: str = "backend/db/knowledge_meta.jsonl"
+    FAISS_INDEX_PATH: str = "backend/db/vector_data/knowledge_faiss.index"
+    FAISS_META_PATH: str = "backend/db/vector_data/knowledge_meta.jsonl"
 
     # Memory & cache
-    MEMORY_DB_PATH: str = "backend/db/memory_store.sqlite"
-    EMBEDDING_CACHE_DB: str = "backend/db/embed_cache.sqlite"
+    MEMORY_DB_PATH: str = "backend/db/memory/memory_store.sqlite"
+    EMBEDDING_CACHE_DB: str = "backend/db/embedding_cache/embed_cache.sqlite"
     MEMORY_MAX_TURNS: int = 20
 
     # Reranker

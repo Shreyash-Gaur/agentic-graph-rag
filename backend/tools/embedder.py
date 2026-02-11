@@ -50,7 +50,7 @@ class Embedder:
                 "note": "Unknown embedding response shape",
                 "text": text
             }
-            with open("backend/db/embed_debug.json", "w") as f:
+            with open("backend/db/embedding_cache/embed_debug.json", "w") as f:
                 json.dump(dbg, f, indent=2)
             raise RuntimeError(f"Unknown embedding response format. Saved to embed_debug.json.")
 

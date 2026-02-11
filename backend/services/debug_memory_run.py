@@ -16,7 +16,7 @@ import pprint
 from backend.services.memory_service import MemoryService
 
 def main():
-    m = MemoryService(max_history=5, use_sqlite=True, db_path="backend/db/memory_store.sqlite")
+    m = MemoryService(max_history=5, use_sqlite=True, db_path="backend/db/memory/memory_store.sqlite")
     print("Adding two turns into conversation 'conv1'...")
     m.add_turn("conv1", "user", "Hello")
     m.add_turn("conv1", "assistant", "Hi there")
@@ -32,7 +32,7 @@ def main():
     print("After clear, get_history:", m.get_history("conv1"))
 
     m.close()
-    print("\nDone. DB persisted at backend/db/memory_store.sqlite (if use_sqlite=True)")
+    print("\nDone. DB persisted at backend/db/memory/memory_store.sqlite (if use_sqlite=True)")
 
 if __name__ == "__main__":
     main()

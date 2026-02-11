@@ -3,7 +3,7 @@
 Convert metadata JSONL -> SQLite metadata_store.db
 
 Usage:
-  python backend/scripts/convert_meta_to_sqlite.py --meta backend/db/book_king_meta.jsonl --out backend/db/metadata_store.db
+  python backend/scripts/convert_meta_to_sqlite.py --meta backend/db/vector_data/knowledge_meta.jsonl --out backend/db/vector_data/metadata_store.db
 """
 from __future__ import annotations
 import argparse, json, sqlite3
@@ -31,7 +31,7 @@ def create_db(out_path: Path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--meta", required=True)
-    parser.add_argument("--out", default="backend/db/metadata_store.db")
+    parser.add_argument("--out", default="backend/db/vector_data/metadata_store.db")
     args = parser.parse_args()
 
     meta_path = Path(args.meta)

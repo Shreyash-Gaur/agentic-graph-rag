@@ -2,7 +2,7 @@ import sqlite3
 import pandas as pd
 
 # Path to your database
-DB_PATH = "backend/db/memory_store.sqlite"
+DB_PATH = "backend/db/memory/memory_store.sqlite"
 
 def read_memory():
     try:

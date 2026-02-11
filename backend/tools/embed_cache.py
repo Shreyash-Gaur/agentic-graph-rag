@@ -6,7 +6,7 @@ from pathlib import Path
 import json
 
 class EmbeddingCache:
-    def __init__(self, cache_dir="backend/db/emb_cache"):
+    def __init__(self, cache_dir="backend/db/embedding_cache"):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
