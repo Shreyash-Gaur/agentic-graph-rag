@@ -124,7 +124,7 @@ def startup_event():
     try:
         retrieve_service = RetrieveService(
             index_path=settings.FAISS_INDEX_PATH,
-            meta_path=settings.FAISS_META_PATH,
+            meta_path=settings.FAISS_META_PATH, # Remove this line if you are using the SQLite Scalable Version - retrieve_service_sqlite.py
             embed_cache=embed_cache,
             embedder=None,
             reranker_obj=reranker_obj,
