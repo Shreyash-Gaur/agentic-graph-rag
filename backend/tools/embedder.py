@@ -15,7 +15,7 @@ class Embedder:
 
     def __init__(self, base_url=None, model=None, timeout=150):
         self.base_url = base_url or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-        self.model = model or os.getenv("EMBEDDER_MODEL", "nomic-embed-text")
+        self.model = model or os.getenv("EMBEDDING_MODEL", "mxbai-embed-large:latest")
         self.timeout = timeout
 
         self.session = requests.Session()

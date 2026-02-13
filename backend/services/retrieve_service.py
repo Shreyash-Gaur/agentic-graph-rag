@@ -1,17 +1,17 @@
 # backend/services/retrieve_service.py
 """
-RetrieveService
-- Wraps a FAISS index + metadata JSONL (Legacy/Local)
+RetrieveService (Hybrid: Graph + SQLite/JSONL)
+- Wraps a FAISS index
+- Metadata: Prefers SQLite (Disk) -> Falls back to JSONL (RAM)
 - Integrates GraphService for Hybrid RAG (Structured + Unstructured)
 - Uses EmbedCacheService to avoid re-embedding identical texts
-- Falls back to repo Embedder if cache misses
-- Optional reranker object can be provided
 """
 
 from __future__ import annotations
 import json
 import os
 import logging
+import sqlite3
 from typing import List, Dict, Any, Optional, Tuple
 
 import numpy as np
@@ -22,9 +22,7 @@ from backend.services.embed_cache_service import EmbedCacheService
 from backend.core.config import settings
 from backend.tools.embedder import Embedder
 
-# Import the new GraphService
-# We use a try-except block or check settings to ensure it doesn't crash if the file isn't there yet,
-# but assuming you've followed the guide, this import is standard.
+# Import the GraphService
 try:
     from backend.services.graph_service import GraphService
 except ImportError:
@@ -32,13 +30,15 @@ except ImportError:
 
 logger = logging.getLogger("agentic-rag.retrieve")
 
-# Default paths (from config if available)
+# Default paths
 DEFAULT_INDEX = settings.FAISS_INDEX_PATH if hasattr(settings, "FAISS_INDEX_PATH") else "backend/db/vector_data/knowledge_faiss.index"
-DEFAULT_META = settings.FAISS_META_PATH if hasattr(settings, "FAISS_META_PATH") else "backend/db/vector_data/knowledge_meta.jsonl"
+DEFAULT_META_JSONL = settings.FAISS_META_PATH if hasattr(settings, "FAISS_META_PATH") else "backend/db/vector_data/knowledge_meta.jsonl"
+DEFAULT_DB_PATH = settings.META_DB_PATH if hasattr(settings, "META_DB_PATH") else "backend/db/vector_data/metadata_store.db" 
 DEFAULT_EMBED_MODEL = settings.EMBEDDING_MODEL if hasattr(settings, "EMBEDDING_MODEL") else "mxbai-embed-large:latest"
 
 
 def _load_meta_lines(meta_path: str) -> List[Dict[str, Any]]:
+    """Legacy helper to load JSONL into memory."""
     meta = []
     if not os.path.exists(meta_path):
         return meta
@@ -50,7 +50,6 @@ def _load_meta_lines(meta_path: str) -> List[Dict[str, Any]]:
             try:
                 meta.append(json.loads(ln))
             except Exception:
-                # tolerate non-json lines
                 meta.append({"text": ln})
     return meta
 
@@ -59,23 +58,44 @@ class RetrieveService:
     def __init__(
         self,
         index_path: str = DEFAULT_INDEX,
-        meta_path: str = DEFAULT_META,
+        meta_path: str = DEFAULT_META_JSONL,   
+        db_path: str = DEFAULT_DB_PATH,       
         embed_cache: Optional[EmbedCacheService] = None,
         embedder: Optional[Embedder] = None,
         reranker_obj: Optional[Any] = None,
         reranker_enabled: bool = False,
-        graph_service: Optional[GraphService] = None,  # Injected GraphService
+        graph_service: Optional[GraphService] = None,
     ):
         self.index_path = index_path
         self.meta_path = meta_path
+        self.db_path = db_path
         self.reranker = reranker_obj
         self.reranker_enabled = bool(reranker_enabled)
 
-        # 1. Load metadata (Legacy FAISS)
-        self.meta: List[Dict[str, Any]] = _load_meta_lines(self.meta_path)
-        logger.info("Loaded metadata entries: %d", len(self.meta))
+        # -------------------------------------------------------
+        # 1. Setup Metadata Store (SQLite preferred, JSONL fallback)
+        # -------------------------------------------------------
+        self.db_conn = None
+        self.meta: List[Dict[str, Any]] = []
 
+        if os.path.exists(self.db_path):
+            # Option A: SQLite (Disk-based, low RAM)
+            try:
+                self.db_conn = sqlite3.connect(self.db_path, check_same_thread=False)
+                self.db_conn.row_factory = sqlite3.Row
+                logger.info(f"RetrieveService connected to SQLite: {self.db_path}")
+            except Exception as e:
+                logger.error(f"Failed to connect to SQLite DB: {e}")
+        
+        # If no DB connection, fall back to loading JSONL into memory
+        if self.db_conn is None:
+            logger.info(f"SQLite DB not found/active. Falling back to JSONL: {self.meta_path}")
+            self.meta = _load_meta_lines(self.meta_path)
+            logger.info("Loaded metadata entries (RAM): %d", len(self.meta))
+
+        # -------------------------------------------------------
         # 2. Load FAISS index lazily
+        # -------------------------------------------------------
         self._index: Optional[faiss.Index] = None
         self._index_ntotal: int = 0
 
@@ -85,34 +105,56 @@ class RetrieveService:
         self.embed_cache = embed_cache or EmbedCacheService()
 
         # 4. Check FAISS index existence
-        if os.path.exists(self.index_path):
-            try:
-                self._index = faiss.read_index(self.index_path)
-                self._index_ntotal = int(self._index.ntotal)
-                logger.info("FAISS index loaded. ntotal=%d", self._index_ntotal)
-            except Exception as e:
-                logger.exception("Failed to load FAISS index: %s", e)
-                self._index = None
-        else:
-            logger.warning("FAISS index not found at %s", self.index_path)
-            self._index = None
+        self._ensure_index()
 
+        # -------------------------------------------------------
         # 5. Initialize Graph Integration
+        # -------------------------------------------------------
         self.graph_service = graph_service
         self.neo4j_vector = None
         
         if self.graph_service:
             try:
-                # We get the vector store interface from the service
                 self.neo4j_vector = self.graph_service.get_vector_index()
-                logger.info("RetrieveService successfully connected to Neo4j Vector Store.")
+                logger.info("RetrieveService connected to Neo4j Vector Store.")
             except Exception as e:
                 logger.error(f"Failed to attach Neo4j Vector Store: {e}")
 
     # --------------------------
+    # Helper: Unified Metadata Access
+    # --------------------------
+    def _get_meta_by_id(self, idx: int) -> Dict[str, Any]:
+        """
+        Retrieves metadata for a chunk ID from either SQLite or the in-memory list.
+        """
+        if idx < 0:
+            return {}
+
+        # 1. Try SQLite
+        if self.db_conn:
+            try:
+                cursor = self.db_conn.cursor()
+                # Adjust columns based on your schema
+                cursor.execute(
+                    "SELECT chunk_id, doc_name, text, start_token, end_token, pid, block_id FROM chunks WHERE chunk_id = ?", 
+                    (idx,)
+                )
+                row = cursor.fetchone()
+                return dict(row) if row else {}
+            except Exception as e:
+                logger.error(f"Error fetching chunk_id={idx} from DB: {e}")
+                return {}
+
+        # 2. Try In-Memory List
+        if 0 <= idx < len(self.meta):
+            return self.meta[idx]
+
+        return {}
+
+    # --------------------------
     # Hybrid Retrieval (Graph + Vector)
     # --------------------------
-    def retrieve_hybrid(self, query: str, top_k: int = 5) -> List[str]:
+    def retrieve_hybrid(self, query: str, top_k: int = settings.TOP_K_RETRIEVAL) -> List[str]:
         """
         Combines Graph Structured Data (Cypher) + Vector Search (Neo4j or FAISS).
         Returns a list of strings (context chunks).
@@ -129,7 +171,6 @@ class RetrieveService:
                 logger.error(f"Graph structured retrieval failed: {e}")
 
         # 2. Get Vector Data (Unstructured)
-        # Determine how many candidates to fetch (20 if reranking, 5 if not)
         fetch_k = getattr(settings, "RERANKER_INITIAL_K", 20) if(self.reranker_enabled and self.reranker) else top_k
         
         vector_candidates = []
@@ -147,8 +188,7 @@ class RetrieveService:
 
         # B. Fallback to FAISS if Neo4j returned nothing
         if not vector_candidates and self._index is not None:
-            logger.info("Neo4j vector empty/unavailable, falling back to FAISS.")
-            used_source = "FAISS"
+            used_source = "FAISS (SQLite)" if self.db_conn else "FAISS (RAM)"
             
             # Embed and search
             qvec = self.embed_text(query).astype("float32")
@@ -157,28 +197,27 @@ class RetrieveService:
             if I.size > 0:
                 for idx in I[0]:
                     if idx < 0: continue
-                    # Get text from metadata
-                    meta = self.meta[idx] if 0 <= idx < len(self.meta) else {}
+                    # Unified Metadata Fetch
+                    meta = self._get_meta_by_id(int(idx))
                     text = meta.get('text', '')
                     if text:
                         vector_candidates.append(text)
 
-        # 3. RERANKING STEP (FIXED)
+        # 3. RERANKING STEP
         if self.reranker_enabled and self.reranker and vector_candidates:
             try:
-                print(f"\n--- [RERANKER] Scoring {len(vector_candidates)} docs from {used_source} ---")
-                
-                # FIX: Use .score() instead of .predict()
-                # The wrapper class takes (query, [list of strings])
+                print(f"--- [RERANKER] Scoring {len(vector_candidates)} docs from {used_source} ---")
+                # scores = self.reranker.score(query, vector_candidates)
+                # Note: Assuming your reranker uses .score() or similar wrapper
+                # If using CrossEncoder directly: model.predict([[query, doc] for doc in docs])
                 scores = self.reranker.score(query, vector_candidates)
                 
-                # Zip text with scores and sort
                 scored_docs = sorted(
                     zip(vector_candidates, scores), 
                     key=lambda x: x[1], 
                     reverse=True
                 )
-                
+
                 print(f"--- [RERANKER] Top Score: {scored_docs[0][1]:.4f} ---")
                 
                 # Keep top_k
@@ -187,21 +226,77 @@ class RetrieveService:
                 
             except Exception as e:
                 logger.error(f"Hybrid Reranking failed: {e}")
-                # Fallback: just take the top k un-reranked
                 docs.extend(vector_candidates[:top_k])
         else:
-            # No reranker, just take top_k
             docs.extend(vector_candidates[:top_k])
 
         return docs
 
     # --------------------------
+    # Standard Retrieval (Legacy/API)
+    # --------------------------
+    def _build_result_record(self, idx: int, score: float) -> Dict[str, Any]:
+        """Builds result dict using unified metadata fetcher."""
+        meta = self._get_meta_by_id(idx)
+        return {"index": idx, "score": float(score), "meta": meta}
+
+    def retrieve(self, query: str, top_k: int = settings.TOP_K_RETRIEVAL) -> List[Dict[str, Any]]:
+        """
+        Standard retrieval returning dicts with metadata.
+        """
+        # embed query
+        qvec = self.embed_text(query).astype("float32")
+
+        # if reranker enabled
+        if self.reranker_enabled and self.reranker:
+            initial_k = max(getattr(settings, "RERANKER_INITIAL_K", 20), top_k)
+            D, I = self.search_vector(qvec, initial_k)
+            candidates = []
+            if I.size > 0:
+                for dist, idx in zip(D[0], I[0]):
+                    if idx < 0: continue
+                    candidates.append(self._build_result_record(int(idx), float(dist)))
+            
+            try:
+                print(f"--- [RERANKER] Scoring {len(candidates)} documents for query: '{query}' ---")
+                reranked = self.reranker.rerank(query, candidates, top_k=top_k)
+
+                if reranked:
+                    print(f"--- [RERANKER] Top Doc Score: {reranked[0].get('score', 0):.4f} ---")
+                return reranked
+
+            except Exception:
+                logger.exception("Reranker failed, falling back to original scores")
+                return candidates[:top_k]
+        else:
+            D, I = self.search_vector(qvec, top_k)
+            results = []
+            if I.size > 0:
+                for dist, idx in zip(D[0], I[0]):
+                    if idx < 0: continue
+                    results.append(self._build_result_record(int(idx), float(dist)))
+            return results
+
+    def retrieve_batch(self, queries: List[str], top_k: int = settings.TOP_K_RETRIEVAL) -> List[List[Dict[str, Any]]]:
+        if not queries:
+            return [[] for _ in queries]
+
+        vecs = self.embed_batch(queries)
+        out = []
+        for v in vecs:
+            D, I = self.search_vector(v, top_k)
+            res = []
+            if I.size > 0:
+                for dist, idx in zip(D[0], I[0]):
+                    if idx < 0: continue
+                    res.append(self._build_result_record(int(idx), float(dist)))
+            out.append(res)
+        return out
+
+    # --------------------------
     # Embedding helpers (with cache)
     # --------------------------
     def embed_text(self, text: str) -> np.ndarray:
-        """
-        Return a single embedding vector, using cache if available.
-        """
         vec = self.embed_cache.get_vector(text, self.embed_model)
         if vec is not None:
             return vec.astype("float32")
@@ -213,9 +308,6 @@ class RetrieveService:
         return np.asarray(vec, dtype=np.float32)
 
     def embed_batch(self, texts: List[str]) -> np.ndarray:
-        """
-        Batch embedding using cache where possible. Returns np.ndarray shape (n, dim)
-        """
         if not texts:
             return np.zeros((0, 0), dtype=np.float32)
 
@@ -252,17 +344,16 @@ class RetrieveService:
                 try:
                     self._index = faiss.read_index(self.index_path)
                     self._index_ntotal = int(self._index.ntotal)
+                    logger.info("FAISS index loaded. ntotal=%d", self._index_ntotal)
                 except Exception as e:
                     logger.exception("Failed to load FAISS index lazily: %s", e)
                     self._index = None
+            else:
+                logger.warning("FAISS index not found at %s", self.index_path)
 
-    def search_vector(self, vec: np.ndarray, top_k: int = 5) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Query FAISS index with a single vector. Returns distances and indices arrays.
-        """
+    def search_vector(self, vec: np.ndarray, top_k: int = settings.TOP_K_RETRIEVAL) -> Tuple[np.ndarray, np.ndarray]:
         self._ensure_index()
         if self._index is None:
-            # If no index exists, return empty results
             return np.array([[]]), np.array([[]])
             
         q = np.asarray(vec, dtype=np.float32).reshape(1, -1)
@@ -270,81 +361,21 @@ class RetrieveService:
         return D, I
 
     # --------------------------
-    # High-level retrieve APIs (Standard FAISS)
-    # --------------------------
-    def _build_result_record(self, idx: int, score: float) -> Dict[str, Any]:
-        meta = self.meta[idx] if 0 <= idx < len(self.meta) else {}
-        return {"index": idx, "score": float(score), "meta": meta}
-
-    def retrieve(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """
-        Legacy retrieval: FAISS + Reranker.
-        Returns dictionaries with scores and metadata.
-        """
-        # embed query
-        qvec = self.embed_text(query).astype("float32")
-
-        # if reranker enabled, fetch initial candidates larger than top_k
-        if self.reranker_enabled and self.reranker:
-            initial_k = max(getattr(settings, "RERANKER_INITIAL_K", 20), top_k)
-            D, I = self.search_vector(qvec, initial_k)
-            candidates = []
-            if I.size > 0:
-                for dist, idx in zip(D[0], I[0]):
-                    if idx < 0:
-                        continue
-                    candidates.append(self._build_result_record(int(idx), float(dist)))
-            
-            try:
-                print(f"\n--- [RERANKER] Scoring {len(candidates)} documents for query: '{query}' ---") 
-    
-                reranked = self.reranker.rerank(query, candidates, top_k=top_k)
-                if reranked:
-                     print(f"--- [RERANKER] Top Doc Score: {reranked[0].get('score', 0):.4f} ---")
-                return reranked
-            except Exception:
-                logger.exception("Reranker failed, falling back to original scores")
-                return candidates[:top_k]
-        else:
-            D, I = self.search_vector(qvec, top_k)
-            results = []
-            if I.size > 0:
-                for dist, idx in zip(D[0], I[0]):
-                    if idx < 0:
-                        continue
-                    results.append(self._build_result_record(int(idx), float(dist)))
-            return results
-
-    def retrieve_batch(self, queries: List[str], top_k: int = 5) -> List[List[Dict[str, Any]]]:
-        """
-        Batch retrieval: embed queries in batch (uses cache) and search each vector.
-        """
-        if not queries:
-            return [[] for _ in queries]
-
-        vecs = self.embed_batch(queries)
-        out = []
-        for v in vecs:
-            D, I = self.search_vector(v, top_k)
-            res = []
-            if I.size > 0:
-                for dist, idx in zip(D[0], I[0]):
-                    if idx < 0:
-                        continue
-                    res.append(self._build_result_record(int(idx), float(dist)))
-            out.append(res)
-        return out
-
-    # --------------------------
     # Utilities
     # --------------------------
-    def reload_meta(self):
-        self.meta = _load_meta_lines(self.meta_path)
-
     def index_count(self) -> int:
         return self._index_ntotal
 
     def close(self):
+        # Close SQLite
+        if hasattr(self, "db_conn") and self.db_conn:
+            try:
+                self.db_conn.close()
+                logger.info("Closed SQLite metadata connection")
+            except Exception:
+                pass
+
+        # Close Cache
         try:
             self.embed_cache.close()
         except Exception:

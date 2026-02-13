@@ -123,13 +123,11 @@ def startup_event():
     # 6. Retrieve Service (Updated to accept graph_service)
     try:
         retrieve_service = RetrieveService(
-            index_path=settings.FAISS_INDEX_PATH,
-            meta_path=settings.FAISS_META_PATH, # Remove this line if you are using the SQLite Scalable Version - retrieve_service_sqlite.py
             embed_cache=embed_cache,
             embedder=None,
             reranker_obj=reranker_obj,
             reranker_enabled=bool(reranker_obj),
-            graph_service=graph_service  # <--- INJECTED HERE
+            graph_service=graph_service
         )
         logger.info(f"RetrieveService initialized (index={settings.FAISS_INDEX_PATH})")
     except Exception as e:
@@ -227,13 +225,14 @@ def query_endpoint(req: QueryRequest):
             chat_history = memory_service.get_context(session_id, last_n=10)
 
         # Determine mode
-        mode = "detailed" if req.max_tokens > 512 else "concise"
+        mode = "detailed" if req.max_tokens > settings.MAX_TOKENS else "concise"
         
         # 2. Pass History to Agent
         output = rag_agent.query(
             query=req.query, 
             mode=mode, 
             temperature=req.temperature,
+            max_tokens=req.max_tokens,
             chat_history=chat_history  
         )
         answer_text = output.get("answer", "No answer generated.")
@@ -266,68 +265,31 @@ def query_endpoint(req: QueryRequest):
 # ------------------------------
 # Ingestion Endpoints
 # ------------------------------
-INGEST_UPLOAD_DIR = Path("knowledge")
+INGEST_UPLOAD_DIR = Path(settings.WATCH_DIR)
 INGEST_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-def _run_ingest_subprocess(cmd_list: List[str], env: Optional[Dict[str, str]] = None, log_prefix: str = "ingest") -> Dict[str, str]:
-    repo_root = Path(__file__).resolve().parents[1]
-    
-    log_dir = repo_root / "logs" / "ingests"
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    cmd_str = " ".join(shlex.quote(p) for p in cmd_list)
-    ts = int(time.time())
-    out_log = log_dir / f"{log_prefix}-{ts}.out.log"
-    err_log = log_dir / f"{log_prefix}-{ts}.err.log"
-
-    full_env = os.environ.copy()
-    if env:
-        full_env.update(env)
-
-    # Ensure pythonpath includes the root
-    if "PYTHONPATH" not in full_env:
-        full_env["PYTHONPATH"] = str(repo_root)
-
-    out_f = open(out_log, "ab")
-    err_f = open(err_log, "ab")
-
-    p = subprocess.Popen(cmd_list, env=full_env, stdout=out_f, stderr=err_f, start_new_session=True)
-
-    return {"pid": p.pid, "out_log": str(out_log), "err_log": str(err_log), "cmd": cmd_str}
+# _run_ingest_subprocess is deleted because we don't need it anymore.
 
 @APP.post("/ingest/upload")
 async def ingest_upload(file: UploadFile = File(...), background_tasks: BackgroundTasks = None):
     """
-    Uploads a file and triggers the GRAPH ingestion script.
+    Uploads a file to the WATCH_DIR. 
+    The running 'ingest_graph_watch.py' or 'ingest_vector_watch.py' will detect and process it automatically.
     """
     filename = Path(file.filename).name
+    # Ensure we use the configured watch directory
     out_path = INGEST_UPLOAD_DIR / filename
-    with out_path.open("wb") as fh:
-        content = await file.read()
-        fh.write(content)
-
-    # Trigger Graph Ingestion Script
-    repo_root = Path(__file__).resolve().parents[1]
-    script_path = repo_root / "backend" / "scripts" / "ingest_graph.py"
     
-    # Verify script exists, else fall back or error
-    if not script_path.exists():
-        # Fallback to old ingestion if graph script isn't there
-        script_path = repo_root / "backend" / "scripts" / "ingest_multi_docs.py"
-
-    cmd_list = [
-        sys.executable,
-        str(script_path),
-        str(out_path.resolve()) # Argument for the file path
-    ]
-    
-    env = {"PYTHONPATH": str(repo_root)}
-    info = _run_ingest_subprocess(cmd_list, env=env, log_prefix="graph_ingest")
-
-    return {
-        "status": "accepted",
-        "filename": filename,
-        "pid": info["pid"],
-        "logs": info["out_log"],
-        "note": "Triggered graph ingestion"
-    }
+    try:
+        with out_path.open("wb") as fh:
+            content = await file.read()
+            fh.write(content)
+            
+        return {
+            "status": "accepted",
+            "filename": filename,
+            "note": "File saved. The watcher script will detect and ingest it shortly."
+        }
+    except Exception as e:
+        logger.error(f"Failed to save upload: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to save file: {e}")

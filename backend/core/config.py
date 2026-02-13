@@ -37,31 +37,44 @@ class Settings(BaseSettings):
     # Ollama / Embedding (your chosen defaults)
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "qwen2.5:7b"
-    EMBEDDING_MODEL: str = "nomic-embed-text"
+    EMBEDDING_MODEL: str = "mxbai-embed-large:latest"
 
-    # RAG Behavior
-    TOP_K_RETRIEVAL: int = 5
+# Vector / General RAG Behavior
+    MAX_TOKENS: int = 512
+    MAX_ITERATIONS: int = 6
+    TOP_K_RETRIEVAL: int = 3
+    
+    # Vector Chunking
     CHUNK_TOKENS: int = 512
     CHUNK_OVERLAP: int = 128
+    EMBEDDING_BATCH_SIZE: int = 32
+
+    # NEW: Graph Chunking
+    GRAPH_CHUNK_TOKENS: int = 256
+    GRAPH_CHUNK_OVERLAP: int = 32
 
     # Neo4j Config
     NEO4J_URI: str = "bolt://localhost:7687"
     NEO4J_USERNAME: str = "neo4j"
     NEO4J_PASSWORD: str = "password"
 
+    # Watcher folder
+    WATCH_DIR: str = "knowledge"
+
     # Paths
     FAISS_INDEX_PATH: str = "backend/db/vector_data/knowledge_faiss.index"
     FAISS_META_PATH: str = "backend/db/vector_data/knowledge_meta.jsonl"
+    META_DB_PATH: str = "backend/db/vector_data/metadata_store.db"
 
     # Memory & cache
     MEMORY_DB_PATH: str = "backend/db/memory/memory_store.sqlite"
     EMBEDDING_CACHE_DB: str = "backend/db/embedding_cache/embed_cache.sqlite"
-    MEMORY_MAX_TURNS: int = 20
+    MEMORY_MAX_TURNS: int = 100
 
     # Reranker
     RERANKER_ENABLED: bool = True
     RERANKER_MODEL: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-    RERANKER_INITIAL_K: int = 20
+    RERANKER_INITIAL_K: int = 9
 
     # Chainlit
     CHAINLIT_ENABLED: bool = True
