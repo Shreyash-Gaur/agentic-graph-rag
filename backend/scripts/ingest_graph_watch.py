@@ -36,7 +36,7 @@ def ingest_file(file_path: Path):
             loader = TextLoader(str(file_path))
             
         docs = loader.load()
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=250, chunk_overlap=24)
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=settings.GRAPH_CHUNK_TOKENS, chunk_overlap=settings.GRAPH_CHUNK_OVERLAP)
         documents = text_splitter.split_documents(documents=docs)
         print(f"Created {len(documents)} chunks.")
 
@@ -77,7 +77,7 @@ def ingest_file(file_path: Path):
         print(f"!!! [Graph] Failed to ingest {file_path.name}: {e}")
         traceback.print_exc()
 
-# --- 3. The Watcher Logic (From ingest_watch.py) ---
+# --- 3. The Watcher Logic (From ingest_vector_watch.py) ---
 def find_files(dirpath: Path):
     """Return a list of supported files in the directory."""
     exts = [".pdf", ".txt", ".md"]
@@ -91,7 +91,7 @@ def find_files(dirpath: Path):
 
 def main():
     parser = argparse.ArgumentParser(description="Watch folder and ingest into Neo4j")
-    parser.add_argument("--watch", default="knowledge", help="Folder to watch")
+    parser.add_argument("--watch", default=settings.WATCH_DIR, help="Folder to watch")
     parser.add_argument("--interval", type=int, default=10, help="Polling interval in seconds")
     args = parser.parse_args()
 
