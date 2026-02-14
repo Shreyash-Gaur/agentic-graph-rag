@@ -1,15 +1,18 @@
 
 services:
   neo4j:
-    build: ./neo4j
+    image: neo4j:5.22.0  # Use the image directly, no 'build' needed
     ports:
       - "7474:7474"
       - "7687:7687"
     environment:
+      # Auth
       NEO4J_AUTH: "neo4j/your_password"
+      NEO4J_PLUGINS: '["apoc"]'
+      # APOC Configuration & Permissions
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*"
       NEO4J_apoc_export_file_enabled: "true"
       NEO4J_apoc_import_file_enabled: "true"
       NEO4J_apoc_import_file_use__neo4j__config: "true"
-      NEO4J_dbms_security_procedures_unrestricted: "apoc.*"
     volumes:
       - ./backend/db/neo4j_data:/data
