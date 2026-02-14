@@ -36,13 +36,13 @@ class Settings(BaseSettings):
 
     # Ollama / Embedding (your chosen defaults)
     OLLAMA_BASE_URL: str = "http://localhost:11434"
-    OLLAMA_MODEL: str = "qwen2.5:7b"
+    OLLAMA_MODEL: str = "phi3:mini"
     EMBEDDING_MODEL: str = "mxbai-embed-large:latest"
 
 # Vector / General RAG Behavior
     MAX_TOKENS: int = 512
     MAX_ITERATIONS: int = 6
-    TOP_K_RETRIEVAL: int = 3
+    TOP_K_RETRIEVAL: int = 4
     
     # Vector Chunking
     CHUNK_TOKENS: int = 512
@@ -71,10 +71,14 @@ class Settings(BaseSettings):
     EMBEDDING_CACHE_DB: str = "backend/db/embedding_cache/embed_cache.sqlite"
     MEMORY_MAX_TURNS: int = 100
 
+    # Semantic Cache
+    SEMANTIC_CACHE_MODEL: str = "BAAI/bge-large-en-v1.5"
+    SEMANTIC_CACHE_THRESHOLD: float = 0.80
+
     # Reranker
     RERANKER_ENABLED: bool = True
-    RERANKER_MODEL: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-    RERANKER_INITIAL_K: int = 9
+    RERANKER_MODEL: str = "BAAI/bge-reranker-v2-m3"
+    RERANKER_INITIAL_K: int = 14
 
     # Chainlit
     CHAINLIT_ENABLED: bool = True

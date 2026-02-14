@@ -61,5 +61,5 @@ build/
 
 # Chainlit
 .chainlit/
-
+chainlit.md
 !requirements.txt

@@ -19,6 +19,7 @@ from backend.core.exceptions import AgenticRAGException
 from backend.services.retrieve_service import RetrieveService
 from backend.services.embed_cache_service import EmbedCacheService
 from backend.services.memory_service import MemoryService
+from backend.services.semantic_cache_service import SemanticCacheService
 from backend.tools.ollama_client import OllamaClient
 
 # --- Graph Service Import ---
@@ -56,8 +57,9 @@ APP.add_middleware(
 retrieve_service: Optional[RetrieveService] = None
 embed_cache: Optional[EmbedCacheService] = None
 memory_service: Optional[MemoryService] = None
+semantic_cache: Optional[SemanticCacheService] = None
 ollama_client: Optional[OllamaClient] = None
-graph_service: Optional[GraphService] = None  # <--- NEW Global
+graph_service: Optional[GraphService] = None 
 
 # Global Agent Instance
 rag_agent: Optional[GraphRAGAgent] = None
@@ -68,8 +70,7 @@ def startup_event():
     """
     Initialize services and the Graph Agent.
     """
-    global memory_service, embed_cache, retrieve_service, ollama_client, graph_service
-    global rag_agent
+    global memory_service, semantic_cache, embed_cache, retrieve_service, ollama_client, graph_service, rag_agent
 
     logger.info("Starting Agentic-RAG service...")
 
@@ -84,6 +85,13 @@ def startup_event():
         logger.info(f"MemoryService initialized: {settings.MEMORY_DB_PATH}")
     except Exception as e:
         logger.exception(f"Failed to init MemoryService: {e}")
+    
+    # 1.5 Semantic Query Cache
+    try:
+        semantic_cache = SemanticCacheService()
+        logger.info("SemanticCacheService initialized successfully.")
+    except Exception as e:
+        logger.exception(f"Failed to init SemanticCacheService: {e}")
 
     # 2. Embed Cache
     try:
@@ -208,6 +216,7 @@ def retrieve_endpoint(req: RetrieveRequest):
         logger.exception("Retrieve failed")
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @APP.post("/query", response_model=QueryResponse)
 def query_endpoint(req: QueryRequest):
     """
@@ -217,17 +226,34 @@ def query_endpoint(req: QueryRequest):
         raise HTTPException(status_code=503, detail="RAG Agent not initialized")
 
     try:
-        # 1. Retrieve History (If memory service exists)
-        chat_history = ""
         session_id = getattr(req, "session_id", "default_session")
         
+        # ---------------------------------------------------------
+        # 1. NEW: Check Semantic Cache FIRST
+        # ---------------------------------------------------------
+        if semantic_cache:
+            cached_answer = semantic_cache.check_cache(req.query)
+            if cached_answer:
+                # Cache HIT! Skip everything and return instantly.
+                return QueryResponse(
+                    query=req.query,
+                    answer=cached_answer,
+                    sources=[], 
+                    num_sources=0,
+                    prompt="semantic_cache",
+                    metadata={"cached": True, "notice": "Answer served instantly from Semantic Memory"}
+                )
+        # ---------------------------------------------------------
+
+        # 2. Retrieve History (If memory service exists)
+        chat_history = ""
         if memory_service:
             chat_history = memory_service.get_context(session_id, last_n=10)
 
         # Determine mode
         mode = "detailed" if req.max_tokens > settings.MAX_TOKENS else "concise"
         
-        # 2. Pass History to Agent
+        # 3. Pass History to Agent (Cache MISS - doing the heavy lifting)
         output = rag_agent.query(
             query=req.query, 
             mode=mode, 
@@ -237,15 +263,21 @@ def query_endpoint(req: QueryRequest):
         )
         answer_text = output.get("answer", "No answer generated.")
 
-        # 3. Save New Turn (After generating answer)
+        # 4. Save New Turn (After generating answer)
         if memory_service:
             try:
+                # Save to SQLite permanent storage
                 memory_service.add_turn(
                     session_id=session_id,
                     user_input=req.query,
                     ai_output=answer_text
                 )
                 logger.info(f"Saved turn to memory for session: {session_id}")
+                
+                # NEW: Save to the fast FAISS Semantic Cache
+                if semantic_cache:
+                    semantic_cache.add_new_turn(req.query, answer_text)
+                    
             except Exception as e:
                 logger.error(f"Failed to save to memory: {e}")
 
