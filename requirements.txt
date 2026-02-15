@@ -26,6 +26,7 @@ faiss-cpu>=1.8.0
 numpy<2.0.0
 tiktoken
 PyPDF2>=3.0.1
+numexpr>=2.14.1
 
 # Frontend
 chainlit>=1.3.0
