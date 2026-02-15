@@ -36,7 +36,7 @@ class Settings(BaseSettings):
 
     # Ollama / Embedding (your chosen defaults)
     OLLAMA_BASE_URL: str = "http://localhost:11434"
-    OLLAMA_MODEL: str = "phi3:mini"
+    OLLAMA_MODEL: str = "phi4-mini"
     EMBEDDING_MODEL: str = "mxbai-embed-large:latest"
 
 # Vector / General RAG Behavior
@@ -79,7 +79,13 @@ class Settings(BaseSettings):
     RERANKER_ENABLED: bool = True
     RERANKER_MODEL: str = "BAAI/bge-reranker-v2-m3"
     RERANKER_INITIAL_K: int = 14
+    RERANKER_BACKEND: str = "cross-encoder"  # "flag" or "cross-encoder"
+    RERANKER_NORMALIZE: str = "minmax"  # "minmax", "softmax", "none"
+    RERANKER_BATCH_SIZE: int = 16
 
+    # HyDe
+    USE_HYDE: bool = True
+    
     # Chainlit
     CHAINLIT_ENABLED: bool = True
 

@@ -20,11 +20,9 @@ import hashlib
 import logging
 from typing import Optional, List, Dict, Tuple
 import numpy as np
+from backend.core.config import settings
 
 logger = logging.getLogger("agentic-rag.embedcache")
-
-DEFAULT_DB = "backend/db/embedding_cache/embed_cache.sqlite"
-
 
 def _text_model_key(text: str, model: str) -> str:
     h = hashlib.sha256()
@@ -35,7 +33,7 @@ def _text_model_key(text: str, model: str) -> str:
 
 
 class EmbedCacheService:
-    def __init__(self, db_path: str = DEFAULT_DB, enable_wal: bool = True):
+    def __init__(self, db_path: str = settings.EMBEDDING_CACHE_DB, enable_wal: bool = True):
         self.db_path = db_path
         # ensure directory exists
         db_dir = os.path.dirname(os.path.abspath(self.db_path))

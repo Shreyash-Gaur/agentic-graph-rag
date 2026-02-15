@@ -210,18 +210,15 @@ class RetrieveService:
                 # scores = self.reranker.score(query, vector_candidates)
                 # Note: Assuming your reranker uses .score() or similar wrapper
                 # If using CrossEncoder directly: model.predict([[query, doc] for doc in docs])
-                scores = self.reranker.score(query, vector_candidates)
-                
-                scored_docs = sorted(
-                    zip(vector_candidates, scores), 
-                    key=lambda x: x[1], 
-                    reverse=True
-                )
+                # Convert plain strings to reranker-compatible format
+                candidates = [{"meta": {"text": txt}} for txt in vector_candidates]
+                reranked = self.reranker.rerank(query, candidates, top_k=top_k)
 
-                print(f"--- [RERANKER] Top Score: {scored_docs[0][1]:.4f} ---")
-                
-                # Keep top_k
-                final_vectors = [doc for doc, score in scored_docs[:top_k]]
+                if reranked:
+                    top_score = reranked[0].get("_rerank_score", 0)
+                    print(f"--- [RERANKER] Top Doc Score: {top_score:.4f} ---")
+
+                final_vectors = [doc["meta"]["text"] for doc in reranked]
                 docs.extend(final_vectors)
                 
             except Exception as e:
@@ -262,7 +259,7 @@ class RetrieveService:
                 reranked = self.reranker.rerank(query, candidates, top_k=top_k)
 
                 if reranked:
-                    print(f"--- [RERANKER] Top Doc Score: {reranked[0].get('score', 0):.4f} ---")
+                    print(f"--- [RERANKER] Top Doc Score: {reranked[0].get('_rerank_score', 0):.4f} ---")
                 return reranked
 
             except Exception:

@@ -17,17 +17,16 @@ import time
 import os
 import logging
 from typing import List, Dict, Optional, Any
+from backend.core.config import settings
 
 logger = logging.getLogger("agentic-rag.memory")
-
-DEFAULT_DB_PATH = "backend/db/memory/memory_store.sqlite"
 
 class MemoryService:
     def __init__(
         self,
-        max_history: int = 20,
+        max_history: int = settings.MEMORY_MAX_TURNS,
         use_sqlite: bool = True,
-        db_path: str = DEFAULT_DB_PATH,
+        db_path: str = settings.MEMORY_DB_PATH,
         preload: bool = True,
     ):
         self.max_history = int(max_history)
