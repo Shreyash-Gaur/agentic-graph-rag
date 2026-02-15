@@ -3,6 +3,9 @@ from backend.core.config import settings
 from langchain_core.messages import HumanMessage
 from langchain_ollama import ChatOllama
 from langgraph.graph import StateGraph, END
+from backend.tools.query_expander import generate_hyde_document
+from backend.tools.calculator import calculate
+from langchain_core.messages import HumanMessage, ToolMessage
 import json
 
 # --- STATE DEFINITION ---
@@ -70,9 +73,18 @@ class GraphRAGAgent:
         base_k = settings.TOP_K_RETRIEVAL
         top_k = int(base_k * 2) if state["mode"] == "detailed" else base_k
         try:
-            # UPDATED: Use retrieve_hybrid instead of retrieve
-            # This returns List[str] directly
-            docs = self.retrieve_service.retrieve_hybrid(state["question"], top_k=top_k)
+            # 1. Default fallback: Just use the original question
+            search_query = state["question"]
+            
+            # 2. Optional Upgrade: Add HyDE context if enabled
+            if settings.USE_HYDE:
+                hyde_context = generate_hyde_document(state["question"])
+                # Overwrite the search query with the expanded version
+                search_query = state["question"] + "\n\n" + hyde_context
+                
+            # 3. Perform the hybrid search
+            docs = self.retrieve_service.retrieve_hybrid(search_query, top_k=top_k)
+            
         except Exception as e:
             print(f"Retrieval error: {e}")
             docs = []
@@ -128,13 +140,16 @@ class GraphRAGAgent:
             )
         else:
             system_prompt = "You are a concise assistant. Answer directly and briefly."
-
+        # Instruct the LLM to use the tool if math is required
+        system_prompt += "\nIf the user asks a math problem, you MUST use your calculate tool to get the exact answer."
         writer = ChatOllama(
             model=self.model_name, 
             temperature=state["temperature"],
             num_predict=token_limit
         )
 
+        # 1. NEW: Bind the Calculator tool to the existing LLM
+        writer_with_tools = writer.bind_tools([calculate])
         prompt = f"""{system_prompt}
         
         Relevant Context:
@@ -146,7 +161,33 @@ class GraphRAGAgent:
         Question: {question}
         Answer:"""
         
-        res = writer.invoke([HumanMessage(content=prompt)]).content
+        messages = [HumanMessage(content=prompt)]
+        
+        # 2. NEW: First LLM Pass (It decides to either answer normally OR use the tool)
+        response = writer_with_tools.invoke(messages)
+        
+        # 3. NEW: Check if the LLM decided to use the Calculator
+        if response.tool_calls:
+            # Append the AI's tool request to the message history
+            messages.append(response) 
+            
+            for tool_call in response.tool_calls:
+                if tool_call["name"] == "calculate":
+                    math_expression = tool_call["args"].get("expression", "")
+                    print(f"🛠️ LLM called Calculator for: {math_expression}")
+                    
+                    # Execute the Python math code safely
+                    math_result = calculate.invoke(tool_call["args"])
+                    print(f"🧮 Calculator returned: {math_result}")
+                    
+                    # Append the exact math answer as a ToolMessage
+                    messages.append(ToolMessage(content=str(math_result), tool_call_id=tool_call["id"]))
+            
+            # 4. NEW: Second LLM Pass (Reads the math answer and formats the final response)
+            response = writer_with_tools.invoke(messages)
+        
+        # Extract the final text content
+        res = response.content
         return {"generation": res, "steps": ["generate"]}
 
     # --- EDGES & GRAPH ---

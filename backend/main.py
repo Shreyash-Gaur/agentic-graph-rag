@@ -20,7 +20,6 @@ from backend.services.retrieve_service import RetrieveService
 from backend.services.embed_cache_service import EmbedCacheService
 from backend.services.memory_service import MemoryService
 from backend.services.semantic_cache_service import SemanticCacheService
-from backend.tools.ollama_client import OllamaClient
 
 # --- Graph Service Import ---
 try:
@@ -58,7 +57,6 @@ retrieve_service: Optional[RetrieveService] = None
 embed_cache: Optional[EmbedCacheService] = None
 memory_service: Optional[MemoryService] = None
 semantic_cache: Optional[SemanticCacheService] = None
-ollama_client: Optional[OllamaClient] = None
 graph_service: Optional[GraphService] = None 
 
 # Global Agent Instance
@@ -70,7 +68,7 @@ def startup_event():
     """
     Initialize services and the Graph Agent.
     """
-    global memory_service, semantic_cache, embed_cache, retrieve_service, ollama_client, graph_service, rag_agent
+    global memory_service, semantic_cache, embed_cache, retrieve_service, graph_service, rag_agent
 
     logger.info("Starting Agentic-RAG service...")
 
@@ -86,36 +84,29 @@ def startup_event():
     except Exception as e:
         logger.exception(f"Failed to init MemoryService: {e}")
     
-    # 1.5 Semantic Query Cache
+    # 2. Semantic Query Cache
     try:
         semantic_cache = SemanticCacheService()
         logger.info("SemanticCacheService initialized successfully.")
     except Exception as e:
         logger.exception(f"Failed to init SemanticCacheService: {e}")
 
-    # 2. Embed Cache
+    # 3. Embed Cache
     try:
         embed_cache = EmbedCacheService(db_path=settings.EMBEDDING_CACHE_DB)
         logger.info(f"EmbedCacheService initialized: {settings.EMBEDDING_CACHE_DB}")
     except Exception as e:
         logger.exception(f"Failed to init EmbedCacheService: {e}")
 
-    # 3. Reranker (Lazy loaded inside RetrieveService if passed)
+    # 4. Reranker (Lazy loaded inside RetrieveService if passed)
     reranker_obj = None
     if settings.RERANKER_ENABLED:
         try:
-            from backend.tools.reranker import CrossEncoderReranker
-            reranker_obj = CrossEncoderReranker(model_name=settings.RERANKER_MODEL)
+            from backend.tools.reranker import Reranker
+            reranker_obj = Reranker()
             logger.info(f"Reranker loaded: {settings.RERANKER_MODEL}")
         except Exception as e:
             logger.exception(f"Failed to load reranker: {e}")
-
-    # 4. Ollama Client
-    try:
-        ollama_client = OllamaClient(base_url=settings.OLLAMA_BASE_URL)
-        logger.info(f"Ollama client ready at {settings.OLLAMA_BASE_URL}")
-    except Exception as e:
-        logger.exception(f"Failed to init OllamaClient: {e}")
 
     # 5. Graph Service (NEW)
     if GraphService:
@@ -172,7 +163,6 @@ def health():
         "status": "ok",
         "retriever": bool(retrieve_service),
         "rag_agent": bool(rag_agent),
-        "ollama": bool(ollama_client),
         "graph_service": bool(graph_service)
     }
 
