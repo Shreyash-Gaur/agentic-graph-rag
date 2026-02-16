@@ -1,191 +1,188 @@
-# 🧠 Agentic Graph RAG: A Self-Correcting Hybrid Retrieval System
 
-> **A local-first RAG system that combines Structured Knowledge (Graph) with Unstructured Context (Vector) using an autonomous agentic workflow.**
+# Agentic Graph-RAG: Hybrid Knowledge Retrieval & Multi-Step Reasoning
 
-## 📖 Overview
+## Project Overview
 
-Standard RAG pipelines often fail on complex queries that require **multi-hop reasoning** or **global dataset understanding**. This project solves that by implementing a **Hybrid Agentic Architecture**.
+Agentic Graph-RAG is a production-ready, highly optimized AI retrieval system that solves the fundamental limitations of standard vector-only RAG (hallucinations, context fragmentation, and multi-hop reasoning failures).
 
-Instead of blindly retrieving top-k chunks, this system employs a **Router-Grader-Solver** loop:
+This system utilizes a **Hybrid Retrieval strategy**, fusing dense vector search (FAISS) for semantic similarity with structured knowledge graph traversal (Neo4j) for entity-relationship mapping. It is orchestrated by an autonomous LangGraph agent that evaluates document relevance, dynamically rewrites queries, and utilizes external tools (like mathematical calculators) to synthesize highly accurate responses. It is designed to act as an intelligent, context-aware backend for enterprise applications requiring precise domain knowledge extraction.
 
-1. **Router:** Dynamically selects the best retrieval strategy (Graph, Vector, or Both).
-2. **Grader:** Evaluates retrieved documents for relevance *before* generation.
-3. **Self-Correction:** If retrieval is insufficient, the agent rewrites the query and retries.
+## Key Features
 
-This approach significantly reduces hallucinations and improves performance on questions requiring relationship traversal (e.g., *Who is X's great-grandfather?*).
+* **Agentic Orchestration (LangGraph):** Implements an advanced state machine with self-correction routing (Route  Retrieve  Grade  Transform  Generate).
+* **Hybrid Retrieval Engine:** Combines un-structured vector search (FAISS/mxbai-embed-large) with structured graph queries (Neo4j) via entity extraction to capture both semantic meaning and relational context.
+* **Production-Grade Reranking:** Integrates BAAI Cross-Encoder reranking with customizable score normalization (MinMax/Sigmoid/Softmax) to refine hybrid search results.
+* **Advanced Query Optimization:** Utilizes HyDE (Hypothetical Document Embeddings) to expand sparse user queries into context-rich semantic search vectors.
+* **Multi-Tier Caching Architecture:** Features a FAISS-backed Semantic Cache (SentenceTransformers) for instant  query hits and an SQLite-backed embedding cache to minimize redundant compute.
+* **Automated Watcher-Based Ingestion:** Features decoupled background processes for atomic, non-blocking asynchronous ingestion of documents into both vector and graph databases.
+* **LLM Tool Calling:** Employs explicit tool binding (e.g., a `numexpr` calculator) to prevent LLM arithmetic hallucinations.
 
----
+## System Architecture
 
-## 🏗️ Architecture
+```text
+[ User Input ] 
+      │ (via Chainlit UI / REST API)
+      ▼
+┌────────────────────────────────────────────────────────────┐
+│                  FastAPI Backend Server                    │
+│                                                            │
+│  [ Semantic Cache (FAISS) ] ── (Hit) ──> [ Return Answer ] │
+│         │ (Miss)                                           │
+│         ▼                                                  │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │ LangGraph Agentic Workflow                           │  │
+│  │                                                      │  │
+│  │ 1. Router (Vector vs. ChitChat)                      │  │
+│  │ 2. Query Expander (HyDE)                             │  │
+│  │ 3. Hybrid Retriever (Neo4j + FAISS)                  │  │
+│  │ 4. Document Grader (LLM-based relevance check)       │  │
+│  │ 5. Query Transformer (Rewrite if docs fail)          │  │
+│  │ 6. Tool Executor (Calculator, etc.)                  │  │
+│  │ 7. Final Generator (Ollama/phi4-mini)                │  │
+│  └──────────────────────────────────────────────────────┘  │
+└────────────────────────────────────────────────────────────┘
+      │
+      ▼
+[ Output Response + Citations ]
 
-The system runs on a **dual-pipeline** architecture:
+```
 
-### 1. The Knowledge Graph (Structured)
+## Tech Stack
 
-* **Engine:** Neo4j
-* **Role:** Handles relational queries (Family trees, hierarchies, ownership).
-* **Ingestion:** Uses LLMs to extract Entities and Relationships from unstructured text.
+| Category | Technology |
+| --- | --- |
+| **API & Backend** | FastAPI, Uvicorn, Python 3.10+ |
+| **AI/Orchestration** | LangChain, LangGraph, LangChain-Experimental |
+| **LLMs & Embeddings** | Ollama (`phi4-mini`, `mxbai-embed-large`), SentenceTransformers |
+| **Databases** | Neo4j (Graph), FAISS (Vector), SQLite (Memory/Metadata/Cache) |
+| **Reranker** | Cross-Encoder (`BAAI/bge-reranker-v2-m3`) |
+| **Frontend** | Chainlit |
+| **Utilities** | Pydantic, NumExpr (Safe Math), PyPDF2, Tiktoken |
 
-### 2. The Vector Store (Unstructured)
+## Project Structure
 
-* **Engine:** FAISS (Local) & Neo4j Vector Index
-* **Role:** Handles semantic search for descriptions, summaries, and broad concepts.
-* **Ingestion:** Standard chunking and embedding (via Ollama).
+```text
+├── backend/
+│   ├── agents/          # LangGraph state machine & LLM agents
+│   ├── core/            # System config, logging, and custom exceptions
+│   ├── db/              # Local storage for SQLite, FAISS indices, and Neo4j volumes
+│   ├── models/          # Pydantic request/response schemas
+│   ├── scripts/         # Daemon watchers for atomic file ingestion (Graph & Vector)
+│   ├── services/        # Business logic (Retrieval, Memory, Caching, Neo4j connection)
+│   ├── tools/           # Bound LLM tools (Calculator, HyDE Expander, Reranker)
+│   └── main.py          # FastAPI application entry point
+├── frontend/
+│   └── chainlit_app.py  # Interactive chat UI
+├── docker-compose.yaml  # Containerized Neo4j database setup
+├── requirements.txt     # Python dependencies
+└── .env                 # Environment variables configuration
 
-### 3. The Reasoning Agent (The Brain)
+```
 
-* **Routing:** Uses an LLM classifier to decide:
-* *Relational Query?*  **Execute Cypher Query**
-* *Descriptive Query?*  **Execute Vector Search**
-* *Complex Query?*  **Sequential Hybrid Search**
-
-
-* **Memory:** Persists conversational state in SQLite for multi-turn context.
-
----
-
-## 🚀 Key Features
-
-* **Hybrid Retrieval:** Seamlessly blends Graph traversal with Vector similarity search.
-* **Agentic Routing:** Does not hard-code the retrieval path; the system *decides* the best tool for the job.
-* **Self-Correction (Reflection):** If the initial search yields poor results, the Agent rewrites the query and tries a different strategy.
-* **Precision Re-ranking:** Uses a Cross-Encoder (`ms-marco-MiniLM`) to score and filter retrieved documents, ensuring high relevance before the LLM sees them.
-* **Long-Term Memory:** Conversation history is persisted in SQLite, allowing for context-aware follow-up questions.
-* **Local-First Privacy:** Built on **Ollama**, ensuring no data leaves your local machine (optional OpenAI support available).
-
----
-
-## 🛠️ Tech Stack
-
-* **LLM & Embeddings:** Ollama (Mistral, qwen2.5, Llama 3)
-* **Orchestration:** LangChain, LangGraph
-* **Graph Database:** Neo4j (Dockerized)
-* **Vector Database:** FAISS (Local Index)
-* **Backend:** FastAPI
-* **Frontend:** Chainlit
-* **Monitoring:** Custom Python Logging
-
----
-
-## ⚡ Getting Started
+## Getting Started
 
 ### Prerequisites
 
-* Docker & Docker Compose
-* Python 3.11+
-* Ollama (running locally)
+* Python 3.10+
+* Docker & Docker Compose (for Neo4j)
+* [Ollama](https://ollama.com/) installed locally with `phi4-mini` and `mxbai-embed-large` models pulled.
 
-### Installation
+### Installation & Setup
 
-1. **Clone the repository**
+1. **Clone the repository and install dependencies:**
 ```bash
-git clone https://github.com/yourusername/agentic-graph-rag.git
-cd agentic-graph-rag
+git clone <repo-url>
+cd <repo-dir>
+pip install -r requirements.txt
 
 ```
 
 
-2. **Start Infrastructure (Neo4j)**
+2. **Start the Neo4j Database:**
 ```bash
 docker-compose up -d
 
 ```
 
 
-3. **Install Dependencies**
+3. **Configure the Environment:**
+Review and adjust the `.env` file for your local environment (defaults are provided for a local Ollama/Neo4j setup).
+4. **Start the Watcher Scripts (Optional but recommended for document ingestion):**
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-```
-
-
-4. **Configure Environment**
-Create a `.env` file in the root directory:
-```bash
-cp .env.example .env
-# Edit .env with your Neo4j credentials and Ollama model names
-
-```
-
-
-5. **Ingest Data (Automated)**
-The system supports continuous ingestion. Run two "watchers" in separate terminals to automatically process any file dropped into the `knowledge/` folder.
-**Terminal 1: Vector Watcher (FAISS)**
-*Watches for new files and updates the semantic search index.*
-```bash
-python backend/scripts/ingest_watch.py --watch knowledge
-
-```
-
-
-**Terminal 2: Graph Watcher (Neo4j)**
-*Watches for new files and extracts entities/relationships for the Graph.*
-```bash
+python backend/scripts/ingest_vector_watch.py --watch knowledge
 python backend/scripts/ingest_graph_watch.py --watch knowledge
 
 ```
 
 
-*Now, simply drag-and-drop PDFs into the `knowledge/` folder, and the system will learn them automatically!*
-6. **Run the Application**
-* **Backend:** `uvicorn backend.main:APP --reload --port 8000`
-* **Frontend:** `chainlit run frontend/chainlit_app.py -w --port 8001`
+5. **Run the Application:**
+* **Backend API:** `uvicorn backend.main:APP --port 8000`
+* **Frontend UI:** `chainlit run frontend/chainlit_app.py --port 8001`
 
 
 
----
+## Configuration
 
-## 🧪 Example Scenarios
+Core system behavior is controlled via `.env` and mapped through `backend/core/config.py` using Pydantic Settings. Notable parameters include:
 
-### Scenario 1: Multi-Hop Reasoning (Graph)
+* `MAX_ITERATIONS`: Controls the LangGraph recursion limit for retrieval retries.
+* `TOP_K_RETRIEVAL`: Base number of documents to retrieve before reranking.
+* `RERANKER_ENABLED` / `USE_HYDE`: Feature flags for advanced retrieval optimizations.
+* `SEMANTIC_CACHE_THRESHOLD`: Cosine similarity cutoff (default: `0.80`) for triggering an instant cache hit.
 
-> **User:** *"How is Amico related to Giovanni Caruso?"*
-> **System Reasoning:**
-> 1. Router detects "related to"  Selects **Graph Tool**.
-> 2. Executes Cypher query to traverse 3 generations.
-> 3. **Result:** *"Amico is the great-grandson of Giovanni."* (Correctly inferred without explicit text).
-> 
-> 
+## How It Works — Technical Deep Dive
 
-### Scenario 2: Semantic Search (Vector)
+The retrieval architecture addresses the "lost in the middle" and context-fragmentation problems by utilizing a **Hybrid Strategy**. When a query enters the system, the `RetrieveService` executes two parallel workflows:
 
-> **User:** *"Describe the social causes the family supports."*
-> **System Reasoning:**
-> 1. Router detects "Describe"  Selects **Vector Tool**.
-> 2. Retrieves text chunks about "Food for All" and "Charity."
-> 3. **Result:** Summarized description of their philanthropic work.
-> 
-> 
+1. **Unstructured Semantic Search:** The query is embedded (with an optional HyDE expansion) and run against a FAISS index to find dense semantic matches.
+2. **Structured Graph Traversal:** Simultaneously, an LLM extracts named entities (Person, Organization) from the user's query. These entities are passed into a Cypher query against Neo4j to pull multi-hop neighbor relationships (e.g., finding the indirect connection between two isolated facts across different documents).
 
-### Scenario 3: Self-Correction (Hybrid)
+The merged candidate documents are then passed through a **Cross-Encoder Reranker** (`BAAI/bge-reranker-v2-m3`). The reranker computes a precise attention matrix over the `[Query, Document]` pairs, normalizes the logits using MinMax scaling, and truncates the list to the `TOP_K`. Finally, the `GraphRAGAgent` evaluates these top documents. If the grader determines the documents lack the necessary context to answer the user, the query is rewritten by an LLM and the cycle repeats up to `MAX_ITERATIONS`.
 
-> **User:** *"List all restaurants and their specific locations."*
-> **System Reasoning:**
-> 1. Initial Graph Search yields a list of names but misses locations.
-> 2. **Grader** marks the answer as "Incomplete."
-> 3. **Agent** transforms query to *"Locations of Caruso restaurants"* and triggers **Vector Search**.
-> 4. **Result:** Combines Graph names with Vector locations for a complete answer.
-> 
-> 
+## Example Usage
 
----
+**cURL Request to the REST API:**
 
-## 🔮 Future Improvements
+```bash
+curl -X POST "http://localhost:8000/query" \
+     -H "Content-Type: application/json" \
+     -d '{
+           "query": "What are the financial implications of the new AI product launch?",
+           "top_k": 5,
+           "max_tokens": 1024,
+           "temperature": 0.1
+         }'
 
-* Implement **GraphRAG (Microsoft approach)** for community detection.
-* Deploy to AWS/GCP using container orchestration.
-* Add multi-modal support (Images/Tables).
+```
 
----
+**Response:**
 
-## 🤝 Contributing
+```json
+{
+  "query": "What are the financial implications of the new AI product launch?",
+  "answer": "Based on the retrieved structured relationships and corporate filings, the new AI product is projected to increase operating margins by 14% while requiring an initial capital expenditure of $4.2M...",
+  "sources": [...],
+  "num_sources": 5,
+  "metadata": {"steps": ["router", "retrieve", "grade_documents", "generate"]}
+}
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+```
 
----
+## Performance & Design Decisions
 
-## 📄 License
+* **Thread-Safe Conversational Memory:** The `MemoryService` utilizes `threading.RLock()` to ensure thread safety across concurrent FastAPI requests while asynchronously persisting chat history to an SQLite WAL-mode database.
+* **Semantic Caching:** To drastically reduce LLM inference costs and latency, a FAISS-backed semantic cache intercepts queries using an `IndexFlatIP` (Inner Product) similarity search. Highly similar queries ( 0.80 threshold) bypass the agentic workflow entirely, returning cached answers in milliseconds.
+* **Atomic Writes & Resilient Ingestion:** The multi-document ingestion scripts (`ingest_multi_docs.py`) write to temporary FAISS indices and JSONL files before performing atomic OS-level file replacements, ensuring the active RAG system never reads corrupted data mid-ingestion.
 
-This project is licensed under the MIT License - see the [LICENSE](https://www.google.com/search?q=LICENSE) file for details.
+## Future Improvements
+
+1. **Graph Community Detection:** Implement hierarchical community clustering (similar to Microsoft's GraphRAG approach) to enable global map-reduce summarization capabilities for broad questions like "What is the overall theme of the dataset?".
+2. **Async Database Drivers:** Migrate Neo4j and SQLite connections to fully asynchronous drivers (`neo4j.AsyncGraphDatabase` and `aiosqlite`) to maximize FastAPIs event loop efficiency under heavy concurrent load.
+3. **Multi-Tenant Architecture:** Expand the SQLite memory and Vector stores to include explicit `user_id` and `tenant_id` partitioning for SaaS deployment scalability.
+4. **Dynamic Chunking Strategies:** Transition from static token overlap chunking to semantic chunking (splitting on proposition or embedding shift boundaries) to preserve context integrity during vectorization.
+
+## Author
+
+**Shreyash Gaur** Gen AI & Machine Learning Engineer
+
+[LinkedIn](https://www.google.com/search?q=https://www.linkedin.com/in/shreyashgaur/) | shreyashgaur221@gmail.com / shreyashgaur01@gmail.com
