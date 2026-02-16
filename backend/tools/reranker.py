@@ -81,6 +81,10 @@ class Reranker:
         if len(scores) == 0:
             return scores
 
+        if self.normalize == "sigmoid":
+            # Best for CrossEncoders/BGE to convert logits to probabilities (0 to 1)
+            return 1 / (1 + np.exp(-scores))
+
         if self.normalize == "minmax":
             min_s = np.min(scores)
             max_s = np.max(scores)
@@ -93,7 +97,7 @@ class Reranker:
             exp_scores = np.exp(shifted)
             return exp_scores / np.sum(exp_scores)
 
-        return scores  # fallback
+        return scores
 
     # ---------------------------
     # Scoring
