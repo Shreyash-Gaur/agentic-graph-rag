@@ -1,78 +1,65 @@
+# backend/main.py
+
+from __future__ import annotations
+
+import logging
 import os
 import sys
 import time
 import shlex
-import logging
 import subprocess
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 
-# --- Core Imports ---
-from backend.core.config import settings
-from backend.core.logger import setup_logging
+from backend.core.config     import settings
+from backend.core.logger     import setup_logging
 from backend.core.exceptions import AgenticRAGException
 
-# --- Services ---
-from backend.services.retrieve_service import RetrieveService
-from backend.services.embed_cache_service import EmbedCacheService
-from backend.services.memory_service import MemoryService
+from backend.services.retrieve_service       import RetrieveService
+from backend.services.embed_cache_service    import EmbedCacheService
+from backend.services.memory_service         import MemoryService
 from backend.services.semantic_cache_service import SemanticCacheService
 
-# --- Graph Service Import ---
 try:
     from backend.services.graph_service import GraphService
 except Exception as e:
-    print(f"CRITICAL ERROR IMPORTING GRAPH SERVICE: {e}")
+    print(f"GraphService import failed: {e}")
     GraphService = None
 
-# --- Agents ---
 from backend.agents.graph_agent import GraphRAGAgent
 
-# --- Models ---
-from backend.models.request_models import QueryRequest, RetrieveRequest
+from backend.models.request_models  import QueryRequest, RetrieveRequest
 from backend.models.response_models import QueryResponse, RetrieveResponse, DocumentResult
 
-# ------------------------------
-# Setup
-# ------------------------------
 setup_logging()
-logger = logging.getLogger("agentic-rag")
+logger = logging.getLogger("agentic-rag.api")
 
-APP = FastAPI(title=settings.API_TITLE, version=settings.API_VERSION)
+# ---------------------------------------------------------------------------
+# Globals
+# ---------------------------------------------------------------------------
 
-# CORS
-APP.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Global Service Instances
-retrieve_service: Optional[RetrieveService] = None
-embed_cache: Optional[EmbedCacheService] = None
-memory_service: Optional[MemoryService] = None
-semantic_cache: Optional[SemanticCacheService] = None
-graph_service: Optional[GraphService] = None 
-
-# Global Agent Instance
-rag_agent: Optional[GraphRAGAgent] = None
+retrieve_service: Optional[RetrieveService]     = None
+embed_cache:      Optional[EmbedCacheService]   = None
+memory_service:   Optional[MemoryService]       = None
+semantic_cache:   Optional[SemanticCacheService] = None
+graph_service:    Optional[GraphService]        = None
+rag_agent:        Optional[GraphRAGAgent]       = None
 
 
-@APP.on_event("startup")
-def startup_event():
-    """
-    Initialize services and the Graph Agent.
-    """
+# ---------------------------------------------------------------------------
+# Lifespan
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global memory_service, semantic_cache, embed_cache, retrieve_service, graph_service, rag_agent
 
     logger.info("Starting Agentic-RAG service...")
 
-    # 1. Memory Service
     try:
         memory_service = MemoryService(
             max_history=settings.MEMORY_MAX_TURNS,
@@ -80,75 +67,68 @@ def startup_event():
             db_path=settings.MEMORY_DB_PATH,
             preload=False,
         )
-        logger.info(f"MemoryService initialized: {settings.MEMORY_DB_PATH}")
+        logger.info("MemoryService ready.")
     except Exception as e:
-        logger.exception(f"Failed to init MemoryService: {e}")
-    
-    # 2. Semantic Query Cache
+        logger.exception("MemoryService init failed: %s", e)
+
     try:
         semantic_cache = SemanticCacheService()
-        logger.info("SemanticCacheService initialized successfully.")
+        logger.info("SemanticCacheService ready.")
     except Exception as e:
-        logger.exception(f"Failed to init SemanticCacheService: {e}")
+        logger.exception("SemanticCacheService init failed: %s", e)
 
-    # 3. Embed Cache
     try:
         embed_cache = EmbedCacheService(db_path=settings.EMBEDDING_CACHE_DB)
-        logger.info(f"EmbedCacheService initialized: {settings.EMBEDDING_CACHE_DB}")
+        logger.info("EmbedCacheService ready.")
     except Exception as e:
-        logger.exception(f"Failed to init EmbedCacheService: {e}")
+        logger.exception("EmbedCacheService init failed: %s", e)
 
-    # 4. Reranker (Lazy loaded inside RetrieveService if passed)
     reranker_obj = None
     if settings.RERANKER_ENABLED:
         try:
             from backend.tools.reranker import Reranker
             reranker_obj = Reranker()
-            logger.info(f"Reranker loaded: {settings.RERANKER_MODEL}")
+            logger.info("Reranker loaded: %s", settings.RERANKER_MODEL)
         except Exception as e:
-            logger.exception(f"Failed to load reranker: {e}")
+            logger.exception("Reranker init failed: %s", e)
 
-    # 5. Graph Service (NEW)
     if GraphService:
         try:
             graph_service = GraphService()
-            logger.info("GraphService initialized and connected to Neo4j.")
+            logger.info("GraphService connected to Neo4j.")
         except Exception as e:
-            logger.error(f"Failed to init GraphService (Neo4j might be down): {e}")
+            logger.error("GraphService init failed (Neo4j down?): %s", e)
             graph_service = None
     else:
-        logger.warning("GraphService class not found. Skipping Neo4j init.")
+        logger.warning("GraphService not available.")
 
-    # 6. Retrieve Service (Updated to accept graph_service)
     try:
         retrieve_service = RetrieveService(
             embed_cache=embed_cache,
             embedder=None,
             reranker_obj=reranker_obj,
             reranker_enabled=bool(reranker_obj),
-            graph_service=graph_service
+            graph_service=graph_service,
         )
-        logger.info(f"RetrieveService initialized (index={settings.FAISS_INDEX_PATH})")
+        logger.info("RetrieveService ready (index=%s).", settings.FAISS_INDEX_PATH)
     except Exception as e:
-        logger.exception(f"Failed to init RetrieveService: {e}")
+        logger.exception("RetrieveService init failed: %s", e)
 
-    # 7. Initialize Graph Agent
     if retrieve_service:
         try:
             rag_agent = GraphRAGAgent(
                 retrieve_service=retrieve_service,
-                model_name=settings.OLLAMA_MODEL
+                model_name=settings.OLLAMA_MODEL,
             )
-            logger.info("GraphRAGAgent successfully initialized.")
+            logger.info("GraphRAGAgent ready.")
         except Exception as e:
-            logger.exception(f"Failed to init GraphRAGAgent: {e}")
+            logger.exception("GraphRAGAgent init failed: %s", e)
     else:
-        logger.warning("RetrieveService missing. GraphRAGAgent not initialized.")
+        logger.warning("RetrieveService missing — GraphRAGAgent not started.")
 
+    yield
 
-@APP.on_event("shutdown")
-def shutdown_event():
-    logger.info("Shutting down Agentic-RAG service...")
+    logger.info("Shutting down...")
     for svc in [retrieve_service, embed_cache, memory_service, graph_service]:
         if svc and hasattr(svc, "close"):
             try:
@@ -157,51 +137,48 @@ def shutdown_event():
                 pass
 
 
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+
+APP = FastAPI(title=settings.API_TITLE, version=settings.API_VERSION, lifespan=lifespan)
+
+# FIX: allow_credentials=True with allow_origins=["*"] is rejected by browsers
+APP.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
 @APP.get("/health")
 def health():
     return {
-        "status": "ok",
-        "retriever": bool(retrieve_service),
-        "rag_agent": bool(rag_agent),
-        "graph_service": bool(graph_service)
+        "status":        "ok",
+        "retriever":     bool(retrieve_service),
+        "rag_agent":     bool(rag_agent),
+        "graph_service": bool(graph_service),
+        "semantic_cache": bool(semantic_cache),
     }
 
 
-# ------------------------------
-# Endpoints
-# ------------------------------
-
 @APP.post("/retrieve", response_model=RetrieveResponse)
 def retrieve_endpoint(req: RetrieveRequest):
-    """
-    Direct retrieval endpoint. 
-    NOTE: Using 'retrieve_hybrid' here to show graph results in direct tests.
-    """
     if not retrieve_service:
         raise HTTPException(status_code=503, detail="Retriever not initialized")
-
     try:
-        # Use Hybrid Retrieve to get strings directly
         doc_strings = retrieve_service.retrieve_hybrid(req.query, top_k=req.top_k)
-        
-        # Convert to Pydantic DocumentResult for response consistency
-        # Since hybrid returns strings, we mock the metadata/score for this view
-        doc_results = []
-        for i, text in enumerate(doc_strings):
-            doc = DocumentResult(
-                text=text,
-                score=1.0, # Placeholder
-                metadata={},
-                source="graph/vector",
-                chunk_id=i
-            )
-            doc_results.append(doc)
-
-        return RetrieveResponse(
-            query=req.query,
-            results=doc_results,
-            num_results=len(doc_results)
-        )
+        doc_results = [
+            DocumentResult(text=text, score=1.0, metadata={}, source="graph/vector", chunk_id=i)
+            for i, text in enumerate(doc_strings)
+        ]
+        return RetrieveResponse(query=req.query, results=doc_results, num_results=len(doc_results))
     except Exception as e:
         logger.exception("Retrieve failed")
         raise HTTPException(status_code=500, detail=str(e))
@@ -209,109 +186,117 @@ def retrieve_endpoint(req: RetrieveRequest):
 
 @APP.post("/query", response_model=QueryResponse)
 def query_endpoint(req: QueryRequest):
-    """
-    Main RAG endpoint.
-    """
     if not rag_agent:
         raise HTTPException(status_code=503, detail="RAG Agent not initialized")
 
     try:
-        session_id = getattr(req, "session_id", "default_session")
-        
-        # ---------------------------------------------------------
-        # 1. NEW: Check Semantic Cache FIRST
-        # ---------------------------------------------------------
-        if semantic_cache:
-            cached_answer = semantic_cache.check_cache(req.query)
-            if cached_answer:
-                # Cache HIT! Skip everything and return instantly.
+        session_id = req.conversation_id or "default"
+        user_query = req.query
+
+        # 1. Semantic cache — skip when any of these are true:
+        #    - mode=detailed (long answer button)
+        #    - temperature > 0.1 (creative answer button)
+        #    - max_tokens > default (long answer sends 2x)
+        #    - bypass_cache=True (explicit override)
+        use_cache = (
+            semantic_cache
+            and req.mode == "concise"
+            and req.temperature <= 0.1
+            and req.max_tokens <= settings.MAX_TOKENS
+            and not req.bypass_cache
+        )
+        if use_cache:
+            cached = semantic_cache.check_cache(user_query)
+            if cached:
+                logger.info("Serving from semantic cache.")
+                if memory_service:
+                    memory_service.add_turn(session_id, user_query, cached)
                 return QueryResponse(
-                    query=req.query,
-                    answer=cached_answer,
-                    sources=[], 
+                    query=user_query,
+                    answer=cached,
+                    sources=[],
                     num_sources=0,
                     prompt="semantic_cache",
-                    metadata={"cached": True, "notice": "Answer served instantly from Semantic Memory"}
+                    metadata={"cached": True},
                 )
-        # ---------------------------------------------------------
 
-        # 2. Retrieve History (If memory service exists)
+        # 2. Memory context
         chat_history = ""
         if memory_service:
             chat_history = memory_service.get_context(session_id, last_n=10)
 
-        # Determine mode
-        mode = "detailed" if req.max_tokens > settings.MAX_TOKENS else "concise"
-        
-        # 3. Pass History to Agent (Cache MISS - doing the heavy lifting)
-        output = rag_agent.query(
-            query=req.query, 
-            mode=mode, 
+        # 3. Run agent — mode comes from request field, not inferred from max_tokens
+        output     = rag_agent.query(
+            query=user_query,
+            mode=req.mode,
             temperature=req.temperature,
             max_tokens=req.max_tokens,
-            chat_history=chat_history  
+            chat_history=chat_history,
         )
-        answer_text = output.get("answer", "No answer generated.")
+        ai_answer   = output.get("answer", "No answer generated.")
+        raw_sources = output.get("sources", [])
 
-        # 4. Save New Turn (After generating answer)
+        # 4. Persist
         if memory_service:
             try:
-                # Save to SQLite permanent storage
-                memory_service.add_turn(
-                    session_id=session_id,
-                    user_input=req.query,
-                    ai_output=answer_text
-                )
-                logger.info(f"Saved turn to memory for session: {session_id}")
-                
-                # NEW: Save to the fast FAISS Semantic Cache
-                if semantic_cache:
-                    semantic_cache.add_new_turn(req.query, answer_text)
-                    
+                memory_service.add_turn(session_id, user_query, ai_answer)
+                if semantic_cache and req.mode == "concise" and not req.bypass_cache:
+                    semantic_cache.add_new_turn(user_query, ai_answer)
             except Exception as e:
-                logger.error(f"Failed to save to memory: {e}")
+                logger.error("Failed to save to memory: %s", e)
+
+        # 5. Build source list — FIX: was always sources=[]
+        doc_results = []
+        for i, text in enumerate(raw_sources):
+            if not text:
+                continue
+            doc_results.append(DocumentResult(
+                text=str(text)[:500],
+                score=1.0,
+                metadata={},
+                source="graph/vector",
+                chunk_id=i,
+            ))
 
         return QueryResponse(
-            query=req.query,
-            answer=answer_text,
-            sources=[], 
-            num_sources=0,
+            query=user_query,
+            answer=ai_answer,
+            sources=doc_results,
+            num_sources=len(doc_results),
             prompt="",
-            metadata=output.get("metadata", {})
+            metadata=output.get("metadata", {}),
         )
 
     except Exception as e:
-        logger.exception(f"Agent Query failed: {e}")
+        logger.exception("Agent query failed")
         raise HTTPException(status_code=500, detail=str(e))
 
-# ------------------------------
-# Ingestion Endpoints
-# ------------------------------
+
+# ---------------------------------------------------------------------------
+# Upload
+# ---------------------------------------------------------------------------
+
 INGEST_UPLOAD_DIR = Path(settings.WATCH_DIR)
 INGEST_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-# _run_ingest_subprocess is deleted because we don't need it anymore.
 
 @APP.post("/ingest/upload")
 async def ingest_upload(file: UploadFile = File(...), background_tasks: BackgroundTasks = None):
-    """
-    Uploads a file to the WATCH_DIR. 
-    The running 'ingest_graph_watch.py' or 'ingest_vector_watch.py' will detect and process it automatically.
-    """
     filename = Path(file.filename).name
-    # Ensure we use the configured watch directory
     out_path = INGEST_UPLOAD_DIR / filename
-    
     try:
         with out_path.open("wb") as fh:
-            content = await file.read()
-            fh.write(content)
-            
+            fh.write(await file.read())
         return {
-            "status": "accepted",
+            "status":   "accepted",
             "filename": filename,
-            "note": "File saved. The watcher script will detect and ingest it shortly."
+            "note":     "File saved. Watcher will detect and ingest it shortly.",
         }
     except Exception as e:
-        logger.error(f"Failed to save upload: {e}")
+        logger.error("Failed to save upload: %s", e)
         raise HTTPException(status_code=500, detail=f"Failed to save file: {e}")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("backend.main:APP", host="0.0.0.0", port=8000, reload=settings.DEBUG)
