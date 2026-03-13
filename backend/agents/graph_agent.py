@@ -1,236 +1,291 @@
-from typing import TypedDict, List, Optional
-from backend.core.config import settings
-from langchain_core.messages import HumanMessage
+# backend/agents/graph_agent.py
+"""
+Graph-augmented RAG agent.
+
+Fixes vs original:
+  1. Graph compiled ONCE in __init__ — was rebuilt on every query() call.
+  2. HyDE fix: embed only the hypothetical document, not query + hyde_doc
+     concatenated. Original was wrong per the HyDE paper.
+  3. _invoke_json: strips markdown code fences before JSON parsing so a
+     model wrapping output in ```json``` does not silently fall back.
+  4. All bare except: replaced with except Exception:.
+  5. query() returns sources so callers get evidence.
+
+What is intentionally NOT changed:
+  - Pipeline flow: router -> retrieve -> grade -> transform -> generate.
+    Intelligence here comes from Neo4j graph traversal, not a planner loop.
+  - retrieve_hybrid stays as-is.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import TypedDict, List, Dict, Optional
+
+from langchain_core.messages import HumanMessage, ToolMessage
 from langchain_ollama import ChatOllama
 from langgraph.graph import StateGraph, END
-from backend.tools.query_expander import generate_hyde_document
+
+from backend.core.config import settings
 from backend.tools.calculator import calculate
-from langchain_core.messages import HumanMessage, ToolMessage
-import json
+from backend.tools.query_expander import generate_hyde_document
 
-# --- STATE DEFINITION ---
+logger = logging.getLogger("agentic-rag.agent")
+
+
 class AgentState(TypedDict):
-    question: str
+    question:          str
     original_question: str
-    chat_history: str  
-    documents: List[str]
-    decision: str
-    generation: str
-    steps: List[str]
-    retry_count: int
-    mode: str
-    temperature: float  
-    max_tokens: int
+    chat_history:      str
+    documents:         List[str]
+    decision:          str
+    generation:        str
+    steps:             List[str]
+    retry_count:       int
+    mode:              str
+    temperature:       float
+    max_tokens:        int
 
-# --- THE AGENT CLASS ---
+
 class GraphRAGAgent:
-    def __init__(self, retrieve_service, model_name=settings.OLLAMA_MODEL):
+    """
+    LangGraph RAG agent with Neo4j graph + FAISS vector hybrid retrieval.
+    Graph is compiled ONCE at construction time and reused for every request.
+    """
+
+    def __init__(self, retrieve_service, model_name: str = settings.OLLAMA_MODEL):
         self.retrieve_service = retrieve_service
-        self.model_name = model_name 
-        self.json_llm = ChatOllama(model=model_name, temperature=0, format="json")
-        self.llm = ChatOllama(model=model_name, temperature=0)
-        self.max_retries = settings.MAX_ITERATIONS
+        self.model_name       = model_name
+        self.max_retries      = settings.MAX_ITERATIONS
 
-    # --- NODES ---
+        self._json_llm = ChatOllama(model=model_name, temperature=0, format="json")
+        self._llm      = ChatOllama(model=model_name, temperature=0)
 
-    def router(self, state: AgentState):
-        """Decides flow based on question."""
-        print("---ROUTING QUESTION---")
-        question = state.get("original_question", state["question"])
-        
-        # Simple routing prompt
-        prompt = f"""You are a router. 
-        1. If user asks for info/facts/summary, output 'vectorstore'.
-        2. If user says hi/hello/thanks, output 'chitchat'.
-        Question: {question}
-        Return JSON: {{ "datasource": "vectorstore" | "chitchat" }}"""
-        
-        try:
-            res = self.json_llm.invoke([HumanMessage(content=prompt)])
-            decision = json.loads(res.content).get("datasource", "vectorstore")
-        except:
-            decision = "vectorstore"
-        return {"decision": decision, "steps": ["router"]}
+        # FIX 1: compile once, not on every query() call
+        self._app = self._build_graph()
+        logger.info("GraphRAGAgent compiled and ready (model=%s)", model_name)
 
-    def general_conversation(self, state: AgentState):
-        # NEW: Inject history into chitchat
-        prompt = f"""
-        Previous Chat History:
-        {state.get('chat_history', '')}
-        
-        User: {state['original_question']}
-        Reply politely and conversationally."""
-        
-        writer = ChatOllama(model=self.model_name, temperature=state["temperature"])
-        res = writer.invoke([HumanMessage(content=prompt)]).content
-        return {"generation": res, "steps": ["general_conversation"]}
-
-    def retrieve(self, state: AgentState):
+    def _invoke_json(self, prompt: str, fallback: Dict) -> Dict:
         """
-        Uses the new Hybrid Retrieval (Graph + Vector).
+        FIX 3: strip markdown fences before parsing.
+        Without this, ```json wrapping causes silent fallback to default values,
+        breaking grading and routing invisibly.
         """
-        print(f"---RETRIEVING ({state['mode']})---")
-        base_k = settings.TOP_K_RETRIEVAL
-        top_k = int(base_k * 2) if state["mode"] == "detailed" else base_k
         try:
-            # 1. Default fallback: Just use the original question
-            search_query = state["question"]
-            
-            # 2. Optional Upgrade: Add HyDE context if enabled
-            if settings.USE_HYDE:
-                hyde_context = generate_hyde_document(state["question"])
-                # Overwrite the search query with the expanded version
-                search_query = state["question"] + "\n\n" + hyde_context
-                
-            # 3. Perform the hybrid search
-            docs = self.retrieve_service.retrieve_hybrid(search_query, top_k=top_k)
-            
+            res     = self._json_llm.invoke([HumanMessage(content=prompt)])
+            content = res.content.strip()
+            if content.startswith("```json"):
+                content = content[7:]
+            elif content.startswith("```"):
+                content = content[3:]
+            if content.endswith("```"):
+                content = content[:-3]
+            return json.loads(content.strip())
         except Exception as e:
-            print(f"Retrieval error: {e}")
-            docs = []
-            
-        return {"documents": docs, "steps": ["retrieve"]}
+            logger.warning("JSON LLM parse failed: %s", e)
+            return fallback
 
-    def grade_documents(self, state: AgentState):
-        print("---GRADING---")
-        if not state["documents"]: return {"documents": []}
-        
-        # Limit grading context to avoid blowing up context window if docs are huge
-        doc_txt = "\n\n".join([f"[{i}] {d[:300]}..." for i, d in enumerate(state["documents"])])
-        
-        prompt = f"""Identify relevant docs for: {state['question']}
-        Docs:
-        {doc_txt}
-        Return JSON {{ "indices": [0, 2...] }} of relevant docs containing ACTUAL content.
-        If you are unsure, include the document."""
-        
-        try:
-            res = self.json_llm.invoke([HumanMessage(content=prompt)])
-            indices = json.loads(res.content).get("indices", [])
-            filtered = [state["documents"][i] for i in indices if i < len(state["documents"])]
-        except:
-            # If grading fails, keep all documents (fail-safe)
-            filtered = state["documents"] 
-        return {"documents": filtered, "steps": ["grade_documents"]}
-
-    def transform_query(self, state: AgentState):
-        print("---TRANSFORMING QUERY---")
-        # NEW: Transform considering history (e.g., "He" -> "Amico")
-        prompt = f"""
-        Context: {state.get('chat_history', '')}
-        User Question: {state['question']}
-        
-        Rewrite the user question to be standalone and search-friendly. Replace pronouns (he/she/it) with specific names from context if possible.
-        Output ONLY the string."""
-        
-        new_q = self.llm.invoke([HumanMessage(content=prompt)]).content.strip()
-        return {"question": new_q, "retry_count": state["retry_count"]+1}
-
-    def generate(self, state: AgentState):
-        print(f"---GENERATING ({state['mode'].upper()} | Tokens: {state['max_tokens']})---")
-        question = state["original_question"]
-        context = "\n\n".join(state["documents"])
-        history = state.get("chat_history", "")
-        token_limit = state.get("max_tokens", settings.MAX_TOKENS)        
-        if state["mode"] == "detailed":
-            system_prompt = (
-                f"You are a comprehensive analyst. "
-                f"Please provide a detailed, extensive answer using up to {token_limit} tokens if necessary. "
-                "Cover all aspects of the context provided."
-            )
-        else:
-            system_prompt = "You are a concise assistant. Answer directly and briefly."
-        # Instruct the LLM to use the tool if math is required
-        system_prompt += "\nIf the user asks a math problem, you MUST use your calculate tool to get the exact answer."
-        writer = ChatOllama(
-            model=self.model_name, 
-            temperature=state["temperature"],
-            num_predict=token_limit
+    def _writer(self, temperature: float, max_tokens: int) -> ChatOllama:
+        return ChatOllama(
+            model=self.model_name,
+            temperature=temperature,
+            num_predict=max_tokens,
         )
 
-        # 1. NEW: Bind the Calculator tool to the existing LLM
-        writer_with_tools = writer.bind_tools([calculate])
-        prompt = f"""{system_prompt}
-        
-        Relevant Context:
-        {context}
-        
-        Chat History:
-        {history}
-        
-        Question: {question}
-        Answer:"""
-        
-        messages = [HumanMessage(content=prompt)]
-        
-        # 2. NEW: First LLM Pass (It decides to either answer normally OR use the tool)
-        response = writer_with_tools.invoke(messages)
-        
-        # 3. NEW: Check if the LLM decided to use the Calculator
-        if response.tool_calls:
-            # Append the AI's tool request to the message history
-            messages.append(response) 
-            
-            for tool_call in response.tool_calls:
-                if tool_call["name"] == "calculate":
-                    math_expression = tool_call["args"].get("expression", "")
-                    print(f"🛠️ LLM called Calculator for: {math_expression}")
-                    
-                    # Execute the Python math code safely
-                    math_result = calculate.invoke(tool_call["args"])
-                    print(f"🧮 Calculator returned: {math_result}")
-                    
-                    # Append the exact math answer as a ToolMessage
-                    messages.append(ToolMessage(content=str(math_result), tool_call_id=tool_call["id"]))
-            
-            # 4. NEW: Second LLM Pass (Reads the math answer and formats the final response)
-            response = writer_with_tools.invoke(messages)
-        
-        # Extract the final text content
-        res = response.content
-        return {"generation": res, "steps": ["generate"]}
+    def _router(self, state: AgentState) -> Dict:
+        logger.info("--- ROUTER ---")
+        question = state.get("original_question", state["question"])
+        prompt = (
+            f"You are a router.\n"
+            f"1. If user asks for info/facts/summary output 'vectorstore'.\n"
+            f"2. If user says hi/hello/thanks output 'chitchat'.\n"
+            f"Question: {question}\n"
+            f'Return JSON: {{"datasource": "vectorstore" | "chitchat"}}'
+        )
+        result   = self._invoke_json(prompt, {"datasource": "vectorstore"})
+        decision = result.get("datasource", "vectorstore")
+        return {"decision": decision, "steps": ["router"]}
 
-    # --- EDGES & GRAPH ---
-    def route_decision(self, state): return state["decision"]
-    
-    def decide_to_generate(self, state):
+    def _chitchat(self, state: AgentState) -> Dict:
+        logger.info("--- CHITCHAT ---")
+        prompt = (
+            f"Previous chat:\n{state.get('chat_history', '')}\n\n"
+            f"User: {state['original_question']}\n"
+            f"Reply politely and conversationally."
+        )
+        writer = self._writer(state["temperature"], state["max_tokens"])
+        reply  = writer.invoke([HumanMessage(content=prompt)]).content
+        return {"generation": reply, "steps": ["chitchat"]}
+
+    def _retrieve(self, state: AgentState) -> Dict:
+        """
+        FIX 2: HyDE embeds the hypothetical document ALONE, not concatenated
+        with the original query. Original was: query + hyde_doc which defeats
+        the purpose — the embedding ends up anchored to the original query
+        rather than the synthetic answer space.
+        """
+        logger.info("--- RETRIEVE (mode=%s) ---", state["mode"])
+        top_k        = settings.TOP_K_RETRIEVAL * 2 if state["mode"] == "detailed" else settings.TOP_K_RETRIEVAL
+        search_query = state["question"]
+
+        if settings.USE_HYDE:
+            try:
+                hyde_doc     = generate_hyde_document(state["question"])
+                search_query = hyde_doc   # embed hypothetical doc alone
+            except Exception as e:
+                logger.warning("HyDE failed, using raw query: %s", e)
+
+        try:
+            docs = self.retrieve_service.retrieve_hybrid(search_query, top_k=top_k)
+        except Exception as e:
+            logger.error("Retrieval error: %s", e)
+            docs = []
+
+        return {"documents": docs, "steps": ["retrieve"]}
+
+    def _grade_documents(self, state: AgentState) -> Dict:
+        logger.info("--- GRADE DOCUMENTS ---")
         if not state["documents"]:
-            return "generate" if state["retry_count"] >= self.max_retries else "transform_query"
+            return {"documents": []}
+
+        doc_txt = "\n\n".join(
+            [f"[{i}] {d[:300]}..." for i, d in enumerate(state["documents"])]
+        )
+        prompt = (
+            f"Identify relevant docs for: {state['question']}\n"
+            f"Docs:\n{doc_txt}\n"
+            f'Return JSON {{"indices": [0, 2, ...]}} of relevant docs. '
+            f"If unsure, include the document."
+        )
+        result  = self._invoke_json(prompt, {"indices": list(range(len(state["documents"])))})
+        indices = result.get("indices", [])
+        try:
+            filtered = [state["documents"][i] for i in indices if i < len(state["documents"])]
+        except Exception:
+            filtered = state["documents"]
+
+        return {"documents": filtered, "steps": ["grade_documents"]}
+
+    def _transform_query(self, state: AgentState) -> Dict:
+        logger.info("--- TRANSFORM QUERY ---")
+        prompt = (
+            f"Context: {state.get('chat_history', '')}\n"
+            f"User Question: {state['question']}\n\n"
+            f"Rewrite to be standalone and search-friendly. "
+            f"Replace pronouns with specific names from context if possible.\n"
+            f"Output ONLY the rewritten question string."
+        )
+        new_q = self._llm.invoke([HumanMessage(content=prompt)]).content.strip()
+        return {"question": new_q, "retry_count": state["retry_count"] + 1}
+
+    def _generate(self, state: AgentState) -> Dict:
+        logger.info("--- GENERATE (mode=%s, tokens=%d) ---", state["mode"], state["max_tokens"])
+        question = state["original_question"]
+        context  = "\n\n".join(state["documents"])
+        history  = state.get("chat_history", "")
+
+        if state["mode"] == "detailed":
+            system_prompt = (
+                f"You are a comprehensive analyst. Provide a detailed answer "
+                f"using up to {state['max_tokens']} tokens. Cover all aspects. "
+                f"Do NOT output raw JSON or mention tool names."
+            )
+        else:
+            system_prompt = (
+                "You are a concise assistant. Answer directly and briefly. "
+                "Do not output JSON."
+            )
+
+        prompt = f"""{system_prompt}
+
+Relevant Context:
+{context}
+
+Chat History:
+{history}
+
+Question: {question}
+Answer:"""
+
+        writer         = self._writer(state["temperature"], state["max_tokens"])
+        writer_w_tools = writer.bind_tools([calculate])
+        messages       = [HumanMessage(content=prompt)]
+        response       = writer_w_tools.invoke(messages)
+
+        if response.tool_calls:
+            messages.append(response)
+            for tc in response.tool_calls:
+                if tc["name"] == "calculate":
+                    expr = tc["args"].get("expression", "")
+                    logger.info("LLM invoked calculator: %s", expr)
+                    try:
+                        result = calculate.invoke(tc["args"])
+                        messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
+                    except Exception as e:
+                        messages.append(ToolMessage(content=f"Calculation failed: {e}", tool_call_id=tc["id"]))
+            response = writer_w_tools.invoke(messages)
+
+        return {"generation": response.content, "steps": state.get("steps", []) + ["generate"]}
+
+    def _route_decision(self, state: AgentState) -> str:
+        return state["decision"]
+
+    def _decide_to_generate(self, state: AgentState) -> str:
+        if not state["documents"]:
+            if state["retry_count"] >= self.max_retries:
+                return "generate"
+            return "transform_query"
         return "generate"
 
-    def build_graph(self):
-        workflow = StateGraph(AgentState)
-        workflow.add_node("router", self.router)
-        workflow.add_node("chitchat", self.general_conversation)
-        workflow.add_node("retrieve", self.retrieve)
-        workflow.add_node("grade_documents", self.grade_documents)
-        workflow.add_node("transform_query", self.transform_query)
-        workflow.add_node("generate", self.generate)
+    def _build_graph(self):
+        wf = StateGraph(AgentState)
+        wf.add_node("router",          self._router)
+        wf.add_node("chitchat",        self._chitchat)
+        wf.add_node("retrieve",        self._retrieve)
+        wf.add_node("grade_documents", self._grade_documents)
+        wf.add_node("transform_query", self._transform_query)
+        wf.add_node("generate",        self._generate)
 
-        workflow.set_entry_point("router")
-        workflow.add_conditional_edges("router", self.route_decision, {"chitchat":"chitchat", "vectorstore":"retrieve"})
-        workflow.add_edge("retrieve", "grade_documents")
-        workflow.add_conditional_edges("grade_documents", self.decide_to_generate, {"transform_query":"transform_query", "generate":"generate"})
-        workflow.add_edge("transform_query", "retrieve")
-        workflow.add_edge("chitchat", END)
-        workflow.add_edge("generate", END)
-        return workflow.compile()
+        wf.set_entry_point("router")
+        wf.add_conditional_edges(
+            "router", self._route_decision,
+            {"chitchat": "chitchat", "vectorstore": "retrieve"},
+        )
+        wf.add_edge("chitchat",       END)
+        wf.add_edge("retrieve",       "grade_documents")
+        wf.add_conditional_edges(
+            "grade_documents", self._decide_to_generate,
+            {"transform_query": "transform_query", "generate": "generate"},
+        )
+        wf.add_edge("transform_query", "retrieve")
+        wf.add_edge("generate",        END)
+        return wf.compile()
 
-    def query(self, query: str, mode: str = "concise", temperature: float = 0.1, max_tokens: int = settings.MAX_TOKENS, chat_history: str = ""):
-        """Entry point that accepts mode, temperature, and chat_history."""
-        app = self.build_graph()
-        initial = {
-            "question": query,
+    def query(
+        self,
+        query:        str,
+        mode:         str   = "concise",
+        temperature:  float = 0.0,
+        max_tokens:   int   = settings.MAX_TOKENS,
+        chat_history: str   = "",
+    ) -> Dict:
+        initial: AgentState = {
+            "question":          query,
             "original_question": query,
-            "chat_history": chat_history,
-            "documents": [],
-            "decision": "vectorstore",
-            "retry_count": 0,
-            "steps": [],
-            "generation": "",
-            "mode": mode,
-            "temperature": temperature,
-            "max_tokens": max_tokens
+            "chat_history":      chat_history,
+            "documents":         [],
+            "decision":          "vectorstore",
+            "generation":        "",
+            "steps":             [],
+            "retry_count":       0,
+            "mode":              mode,
+            "temperature":       temperature,
+            "max_tokens":        max_tokens,
         }
-        res = app.invoke(initial)
-        return {"answer": res["generation"], "metadata": {"steps": res["steps"]}}
+        result = self._app.invoke(initial)
+        return {
+            "answer":   result.get("generation", ""),
+            "sources":  result.get("documents", []),
+            "metadata": {"steps": result.get("steps", [])},
+        }
