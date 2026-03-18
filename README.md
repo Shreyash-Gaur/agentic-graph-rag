@@ -199,40 +199,6 @@ API docs available at `http://localhost:8000/docs`.
 
 ---
 
-## Example API Request
-
-```bash
-curl -X POST "http://localhost:8000/query" \
-     -H "Content-Type: application/json" \
-     -d '{
-           "query": "What is the relationship between M. Hamel and the French language?",
-           "mode": "detailed",
-           "top_k": 5,
-           "max_tokens": 1024,
-           "temperature": 0.0,
-           "bypass_cache": false
-         }'
-```
-
-Response:
-
-```json
-{
-  "query": "What is the relationship between M. Hamel and the French language?",
-  "answer": "M. Hamel has a deep emotional and professional connection to the French language...",
-  "sources": [
-    {
-      "text": "Graph Relationships (Structured Context): M. Hamel - TALKED_ABOUT -> French Language ...",
-      "source": "graph/vector"
-    }
-  ],
-  "num_sources": 5,
-  "metadata": {"steps": ["router", "retrieve", "grade_documents", "generate"]}
-}
-```
-
----
-
 ## Engineering Notes
 
 **Graph compiled once** — `GraphRAGAgent.__init__` compiles the LangGraph state machine once and stores it as `self._app`. Earlier versions rebuilt the graph on every `query()` call — a silent performance bug with no error output.
