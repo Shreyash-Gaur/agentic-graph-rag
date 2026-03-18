@@ -1,188 +1,290 @@
-
 # Agentic Graph-RAG: Hybrid Knowledge Retrieval & Multi-Step Reasoning
 
-## Project Overview
+> A fully local, production-ready RAG system that fuses Neo4j knowledge graph traversal with FAISS vector search — solving the hallucination, context fragmentation, and multi-hop reasoning failures that vector-only RAG cannot address.
 
-Agentic Graph-RAG is a production-ready, highly optimized AI retrieval system that solves the fundamental limitations of standard vector-only RAG (hallucinations, context fragmentation, and multi-hop reasoning failures).
+---
 
-This system utilizes a **Hybrid Retrieval strategy**, fusing dense vector search (FAISS) for semantic similarity with structured knowledge graph traversal (Neo4j) for entity-relationship mapping. It is orchestrated by an autonomous LangGraph agent that evaluates document relevance, dynamically rewrites queries, and utilizes external tools (like mathematical calculators) to synthesize highly accurate responses. It is designed to act as an intelligent, context-aware backend for enterprise applications requiring precise domain knowledge extraction.
+## Overview
 
-## Key Features
+Standard vector RAG finds semantically similar passages. It cannot find the relationship between two entities, trace a multi-hop connection across documents, or know when retrieved documents are insufficient and ask a better question.
 
-* **Agentic Orchestration (LangGraph):** Implements an advanced state machine with self-correction routing (Route  Retrieve  Grade  Transform  Generate).
-* **Hybrid Retrieval Engine:** Combines un-structured vector search (FAISS/mxbai-embed-large) with structured graph queries (Neo4j) via entity extraction to capture both semantic meaning and relational context.
-* **Production-Grade Reranking:** Integrates BAAI Cross-Encoder reranking with customizable score normalization (MinMax/Sigmoid/Softmax) to refine hybrid search results.
-* **Advanced Query Optimization:** Utilizes HyDE (Hypothetical Document Embeddings) to expand sparse user queries into context-rich semantic search vectors.
-* **Multi-Tier Caching Architecture:** Features a FAISS-backed Semantic Cache (SentenceTransformers) for instant  query hits and an SQLite-backed embedding cache to minimize redundant compute.
-* **Automated Watcher-Based Ingestion:** Features decoupled background processes for atomic, non-blocking asynchronous ingestion of documents into both vector and graph databases.
-* **LLM Tool Calling:** Employs explicit tool binding (e.g., a `numexpr` calculator) to prevent LLM arithmetic hallucinations.
+This system addresses all three. Neo4j serves as the primary store for both jobs — structured Cypher traversal for entity relationships, and hybrid BM25 + dense vector search for semantic similarity. FAISS and SQLite exist as a fallback layer if Neo4j vector search returns nothing or Neo4j is unavailable. The merged results are reranked by a CrossEncoder before reaching the LLM. If the grader determines the documents don't contain the answer, the query is rewritten and the cycle repeats.
 
-## System Architecture
+The key architectural distinction from Project 1 (Agentic RAG): the intelligence here comes from the graph traversal layer — Neo4j surfaces relational facts that vectors never could — rather than from a multi-step planning loop. The pipeline is intentionally simpler; the retrieval is intentionally richer.
 
-```text
-[ User Input ] 
-      │ (via Chainlit UI / REST API)
-      ▼
-┌────────────────────────────────────────────────────────────┐
-│                  FastAPI Backend Server                    │
-│                                                            │
-│  [ Semantic Cache (FAISS) ] ── (Hit) ──> [ Return Answer ] │
-│         │ (Miss)                                           │
-│         ▼                                                  │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │ LangGraph Agentic Workflow                           │  │
-│  │                                                      │  │
-│  │ 1. Router (Vector vs. ChitChat)                      │  │
-│  │ 2. Query Expander (HyDE)                             │  │
-│  │ 3. Hybrid Retriever (Neo4j + FAISS)                  │  │
-│  │ 4. Document Grader (LLM-based relevance check)       │  │
-│  │ 5. Query Transformer (Rewrite if docs fail)          │  │
-│  │ 6. Tool Executor (Calculator, etc.)                  │  │
-│  │ 7. Final Generator (Ollama/phi4-mini)                │  │
-│  └──────────────────────────────────────────────────────┘  │
-└────────────────────────────────────────────────────────────┘
-      │
-      ▼
-[ Output Response + Citations ]
+---
 
+## Architecture
+
+```mermaid
+graph TD
+    classDef terminal  fill:#e6f4ea,stroke:#34a853,color:#1e6830
+    classDef decision  fill:#e8f0fe,stroke:#4285f4,color:#1a56b0
+    classDef agent     fill:#f3e8fd,stroke:#9334e6,color:#4a1a7a
+    classDef service   fill:#fef3e2,stroke:#fa7b17,color:#7a3d00
+    classDef store     fill:#fce8e6,stroke:#ea4335,color:#c5221f
+
+    A([User Query]):::terminal         --> B{Semantic Cache\nFAISS · bge-large-en-v1.5\nthreshold ≥ 0.85}:::decision
+    B -- cache hit                     --> Z([Response]):::terminal
+    B -- cache miss                    --> C[Memory Service\nlast 10 turns]:::service
+    C                                  --> D{Router\nclassify query}:::decision
+    D -- chitchat                      --> E[Chitchat]:::agent
+    D -- vectorstore                   --> F[HyDE Generator\nhypothetical doc\nembedded alone]:::service
+    E                                  --> Z
+
+    F                                  --> G[Hybrid Retriever]:::agent
+
+    G -- graph branch                  --> H[Neo4j Cypher\nentity extraction\nrelationship traversal]:::service
+    G -- vector branch                 --> I[Neo4j Vector Search\nhybrid BM25 + dense\nprimary vector store]:::service
+    I -- returns nothing               --> IB[FAISS Search\nfallback only]:::service
+
+    H                                  --> J[Merge & CrossEncoder Rerank\nBAAI/bge-reranker-v2-m3]:::service
+    I -- results found                 --> J
+    IB                                 --> J
+
+    J                                  --> K{Grade Documents\nLLM relevance check}:::decision
+    K -- relevant                      --> L[Generate\nqwen2.5:7b\n+ calculator tool]:::agent
+    K -- irrelevant                    --> M[Transform Query\nLLM rewrites question\nmax MAX_ITERATIONS]:::agent
+    M                                  --> F
+
+    L                                  --> Z
+
+    Z -- save turn                     --> N[(Memory Store\nSQLite)]:::store
+    Z -- cache if concise              --> O[(Semantic Cache\nFAISS + SQLite)]:::store
+
+    H -. graph query .->               R[(Neo4j\ngraph + vector)]:::store
+    I -. vector query .->              R
+    IB -. fallback search .->          P[(FAISS Index\nSQLite Metadata)]:::store
 ```
+
+### Pipeline nodes
+
+The **Semantic Cache** intercepts every query before the agent runs. If a sufficiently similar question has been answered before (cosine similarity ≥ 0.85), the cached answer is returned in milliseconds without touching the LLM or the retrieval pipeline.
+
+The **Router** classifies the query as either chitchat (handled directly) or a retrieval question (routed into the hybrid pipeline). This avoids spending a full retrieval-generation cycle on greetings or off-topic messages.
+
+The **HyDE Generator** produces a short hypothetical answer to the user's question. That synthetic document is embedded instead of the raw query — embedding the hypothetical document alone, not concatenated with the original query. This is the correct HyDE implementation: it moves the embedding into the answer space of the corpus rather than the question space.
+
+The **Hybrid Retriever** runs two branches. The graph branch extracts named entities from the query via an LLM, then runs a Cypher query against Neo4j to find direct and reverse entity relationships (e.g. "M. Hamel - TALKED_ABOUT -> French Language"). The vector branch queries Neo4j's built-in hybrid vector search (BM25 sparse + dense embeddings) — Neo4j is the primary vector store, not just the graph store. If Neo4j vector search returns nothing, the retriever automatically falls back to the local FAISS index. All results from both branches feed into the reranker.
+
+The **CrossEncoder Reranker** (`BAAI/bge-reranker-v2-m3`) rescores all merged candidates with a full attention matrix over each `[query, document]` pair and returns the top-K. The top document score is logged on every query.
+
+The **Document Grader** evaluates whether the reranked documents actually contain enough context to answer the question. If they do, the pipeline proceeds to Generate. If they don't, the query is passed to Transform Query.
+
+**Transform Query** rewrites the user's question into a standalone, search-optimised form using the LLM, then sends it back to HyDE for a fresh retrieval pass. This cycle repeats up to `MAX_ITERATIONS` times before forcing a response regardless.
+
+**Generate** assembles the merged graph context and vector chunks, then calls qwen2.5:7b with a mode-appropriate system prompt. The calculator tool is bound at this node and invoked inline if the LLM determines arithmetic is needed.
+
+---
+
+## Hybrid Retrieval — Why Neo4j Does Both Jobs
+
+Vector search finds relevant passages. It does not find relevant facts.
+
+If you ask "what is the relationship between X and Y?", vector search returns chunks that mention X or Y. The Neo4j graph returns the actual edge between them — extracted during ingestion, stored as a typed relationship, and retrieved via Cypher traversal at query time.
+
+Neo4j serves as the primary store for both retrieval types in this system. For vector search, it uses its built-in hybrid search mode — BM25 sparse retrieval combined with dense embedding similarity — which runs directly against the embeddings stored on Document nodes. For graph retrieval, it runs Cypher queries to traverse entity relationship edges. Both happen in the same database, which means the graph context and the vector context are retrieved from a single connected store rather than two separate systems.
+
+FAISS and SQLite serve as the fallback layer. If Neo4j vector search returns no results — because the Neo4j vector index hasn't been populated yet, or because Neo4j itself is unavailable — `RetrieveService` automatically falls back to the local FAISS index. The system continues working in that state, just without the hybrid BM25+dense advantage and without graph context.
+
+The ingestion pipeline reflects this dual role: `ingest_graph_watch.py` extracts named entities, creates Neo4j nodes and relationship edges, and also indexes document embeddings into Neo4j's vector store. `ingest_vector_watch.py` populates the FAISS fallback index in parallel.
+
+---
 
 ## Tech Stack
 
-| Category | Technology |
-| --- | --- |
-| **API & Backend** | FastAPI, Uvicorn, Python 3.10+ |
-| **AI/Orchestration** | LangChain, LangGraph, LangChain-Experimental |
-| **LLMs & Embeddings** | Ollama (`phi4-mini`, `mxbai-embed-large`), SentenceTransformers |
-| **Databases** | Neo4j (Graph), FAISS (Vector), SQLite (Memory/Metadata/Cache) |
-| **Reranker** | Cross-Encoder (`BAAI/bge-reranker-v2-m3`) |
-| **Frontend** | Chainlit |
-| **Utilities** | Pydantic, NumExpr (Safe Math), PyPDF2, Tiktoken |
+| Component | Technology |
+|---|---|
+| Agent orchestration | LangGraph |
+| Backend API | FastAPI |
+| Primary store — graph + vector | Neo4j (Cypher traversal + hybrid BM25/dense vector search) |
+| Fallback vector store | FAISS + SQLite |
+| LLM + embeddings | Ollama — qwen2.5:7b, mxbai-embed-large |
+| Reranker | BAAI/bge-reranker-v2-m3 (CrossEncoder) |
+| Semantic cache encoder | BAAI/bge-large-en-v1.5 |
+| Memory store | SQLite |
+| Frontend | Chainlit |
+
+---
 
 ## Project Structure
 
-```text
-├── backend/
-│   ├── agents/          # LangGraph state machine & LLM agents
-│   ├── core/            # System config, logging, and custom exceptions
-│   ├── db/              # Local storage for SQLite, FAISS indices, and Neo4j volumes
-│   ├── models/          # Pydantic request/response schemas
-│   ├── scripts/         # Daemon watchers for atomic file ingestion (Graph & Vector)
-│   ├── services/        # Business logic (Retrieval, Memory, Caching, Neo4j connection)
-│   ├── tools/           # Bound LLM tools (Calculator, HyDE Expander, Reranker)
-│   └── main.py          # FastAPI application entry point
-├── frontend/
-│   └── chainlit_app.py  # Interactive chat UI
-├── docker-compose.yaml  # Containerized Neo4j database setup
-├── requirements.txt     # Python dependencies
-└── .env                 # Environment variables configuration
-
 ```
+backend/
+├── agents/
+│   └── graph_agent.py          # LangGraph state machine
+├── core/
+│   ├── config.py               # Pydantic settings from .env
+│   ├── logger.py
+│   └── exceptions.py
+├── services/
+│   ├── graph_service.py        # Neo4j connection, entity extraction, Cypher queries
+│   ├── retrieve_service.py     # Hybrid retrieval — Neo4j + FAISS + reranker
+│   ├── memory_service.py       # SQLite-backed conversation memory
+│   ├── semantic_cache_service.py
+│   └── embed_cache_service.py
+├── tools/
+│   ├── embedder.py             # Ollama embedding client
+│   ├── reranker.py             # CrossEncoder wrapper
+│   ├── query_expander.py       # HyDE document generation
+│   └── calculator.py           # LangChain tool for arithmetic
+├── models/
+│   ├── request_models.py       # QueryRequest — mode, bypass_cache fields
+│   └── response_models.py
+├── scripts/
+│   ├── ingest_vector_watch.py  # File watcher — token chunks into FAISS (fallback store)
+│   └── ingest_graph_watch.py   # File watcher — semantic chunks, coreference resolution, 
+|   |                           # entity extraction, Neo4j graph + vector indexing, APOC merge
+│   ├── ingest_multi_docs.py  
+│   └──  convert_meta_to_sqlite.py
+│                               
+└── main.py                     # FastAPI app, lifespan, /query endpoint
+
+frontend/
+└── chainlit_app.py             # Chat UI, voice support, action buttons, file upload
+
+docker-compose.yaml             # Neo4j container
+```
+
+---
 
 ## Getting Started
 
 ### Prerequisites
 
-* Python 3.10+
-* Docker & Docker Compose (for Neo4j)
-* [Ollama](https://ollama.com/) installed locally with `phi4-mini` and `mxbai-embed-large` models pulled.
+- Docker and Docker Compose (for Neo4j)
+- Ollama running locally with the required models pulled:
 
-### Installation & Setup
-
-1. **Clone the repository and install dependencies:**
 ```bash
-git clone <repo-url>
-cd <repo-dir>
-pip install -r requirements.txt
-
+ollama pull qwen2.5:7b
+ollama pull mxbai-embed-large
 ```
 
+### Setup
 
-2. **Start the Neo4j Database:**
+Start Neo4j:
+
 ```bash
 docker-compose up -d
-
 ```
 
+Copy and configure the environment file:
 
-3. **Configure the Environment:**
-Review and adjust the `.env` file for your local environment (defaults are provided for a local Ollama/Neo4j setup).
-4. **Start the Watcher Scripts (Optional but recommended for document ingestion):**
+```bash
+cp .env.example .env
+```
+
+Key settings to verify: `NEO4J_URI`, `NEO4J_PASSWORD`, `OLLAMA_MODEL`, `RERANKER_MODEL`, `SEMANTIC_CACHE_THRESHOLD`.
+
+Start the file watchers (run in separate terminals — one for vector ingestion, one for graph ingestion):
+
 ```bash
 python backend/scripts/ingest_vector_watch.py --watch knowledge
 python backend/scripts/ingest_graph_watch.py --watch knowledge
-
 ```
 
+Start the application:
 
-5. **Run the Application:**
-* **Backend API:** `uvicorn backend.main:APP --port 8000`
-* **Frontend UI:** `chainlit run frontend/chainlit_app.py --port 8001`
+```bash
+# Backend
+uvicorn backend.main:APP --host 0.0.0.0 --port 8000
 
+# Frontend (separate terminal)
+chainlit run frontend/chainlit_app.py -w --port 8001
+```
 
+Drop PDF or TXT files into the `knowledge/` directory. Both watchers will detect new files and ingest them into their respective stores automatically.
 
-## Configuration
+API docs available at `http://localhost:8000/docs`.
 
-Core system behavior is controlled via `.env` and mapped through `backend/core/config.py` using Pydantic Settings. Notable parameters include:
+---
 
-* `MAX_ITERATIONS`: Controls the LangGraph recursion limit for retrieval retries.
-* `TOP_K_RETRIEVAL`: Base number of documents to retrieve before reranking.
-* `RERANKER_ENABLED` / `USE_HYDE`: Feature flags for advanced retrieval optimizations.
-* `SEMANTIC_CACHE_THRESHOLD`: Cosine similarity cutoff (default: `0.80`) for triggering an instant cache hit.
-
-## How It Works — Technical Deep Dive
-
-The retrieval architecture addresses the "lost in the middle" and context-fragmentation problems by utilizing a **Hybrid Strategy**. When a query enters the system, the `RetrieveService` executes two parallel workflows:
-
-1. **Unstructured Semantic Search:** The query is embedded (with an optional HyDE expansion) and run against a FAISS index to find dense semantic matches.
-2. **Structured Graph Traversal:** Simultaneously, an LLM extracts named entities (Person, Organization) from the user's query. These entities are passed into a Cypher query against Neo4j to pull multi-hop neighbor relationships (e.g., finding the indirect connection between two isolated facts across different documents).
-
-The merged candidate documents are then passed through a **Cross-Encoder Reranker** (`BAAI/bge-reranker-v2-m3`). The reranker computes a precise attention matrix over the `[Query, Document]` pairs, normalizes the logits using MinMax scaling, and truncates the list to the `TOP_K`. Finally, the `GraphRAGAgent` evaluates these top documents. If the grader determines the documents lack the necessary context to answer the user, the query is rewritten by an LLM and the cycle repeats up to `MAX_ITERATIONS`.
-
-## Example Usage
-
-**cURL Request to the REST API:**
+## Example API Request
 
 ```bash
 curl -X POST "http://localhost:8000/query" \
      -H "Content-Type: application/json" \
      -d '{
-           "query": "What are the financial implications of the new AI product launch?",
+           "query": "What is the relationship between M. Hamel and the French language?",
+           "mode": "detailed",
            "top_k": 5,
            "max_tokens": 1024,
-           "temperature": 0.1
+           "temperature": 0.0,
+           "bypass_cache": false
          }'
-
 ```
 
-**Response:**
+Response:
 
 ```json
 {
-  "query": "What are the financial implications of the new AI product launch?",
-  "answer": "Based on the retrieved structured relationships and corporate filings, the new AI product is projected to increase operating margins by 14% while requiring an initial capital expenditure of $4.2M...",
-  "sources": [...],
+  "query": "What is the relationship between M. Hamel and the French language?",
+  "answer": "M. Hamel has a deep emotional and professional connection to the French language...",
+  "sources": [
+    {
+      "text": "Graph Relationships (Structured Context): M. Hamel - TALKED_ABOUT -> French Language ...",
+      "source": "graph/vector"
+    }
+  ],
   "num_sources": 5,
   "metadata": {"steps": ["router", "retrieve", "grade_documents", "generate"]}
 }
-
 ```
 
-## Performance & Design Decisions
+---
 
-* **Thread-Safe Conversational Memory:** The `MemoryService` utilizes `threading.RLock()` to ensure thread safety across concurrent FastAPI requests while asynchronously persisting chat history to an SQLite WAL-mode database.
-* **Semantic Caching:** To drastically reduce LLM inference costs and latency, a FAISS-backed semantic cache intercepts queries using an `IndexFlatIP` (Inner Product) similarity search. Highly similar queries ( 0.80 threshold) bypass the agentic workflow entirely, returning cached answers in milliseconds.
-* **Atomic Writes & Resilient Ingestion:** The multi-document ingestion scripts (`ingest_multi_docs.py`) write to temporary FAISS indices and JSONL files before performing atomic OS-level file replacements, ensuring the active RAG system never reads corrupted data mid-ingestion.
+## Engineering Notes
+
+**Graph compiled once** — `GraphRAGAgent.__init__` compiles the LangGraph state machine once and stores it as `self._app`. Earlier versions rebuilt the graph on every `query()` call — a silent performance bug with no error output.
+
+**HyDE correctness** — the hypothetical document is embedded alone, not concatenated with the raw query. Concatenation anchors the embedding to the question space rather than the answer space, defeating the purpose of HyDE.
+
+**JSON parsing robustness** — the router and grader nodes parse LLM JSON output. The `_invoke_json` helper strips markdown code fences before parsing to prevent silent fallback to default values when the model wraps output in ` ```json ``` ` blocks.
+
+**Neo4j vector indexing** — `add_graph_documents()` only writes entity nodes and relationship edges. It does not embed document text. Without an explicit `Neo4jVector.from_documents()` call during ingestion, `Neo4jVector.from_existing_graph()` finds no embeddings and vector search silently returns empty results on every query — causing the system to always fall back to FAISS. `graph_service.index_documents_to_neo4j()` is called after every `add_graph_documents()` to ensure the vector store is populated. Both calls use the same `index_name="document_vector_index"` — this must match or `from_existing_graph` cannot find the embeddings.
+
+**Three-tier entity disambiguation pipeline** — entity extraction quality in Neo4j depends on consistent node naming across chunks. The ingestion pipeline addresses this at three layers. Tier 1 is a strict extraction prompt on `LLMGraphTransformer` that instructs the LLM to always use the most specific name form and never merge distinct entities that share a partial name ("M. Hamel" and "C. Hamel" are different people). Tier 2 is LLM coreference resolution before extraction — each chunk is rewritten to replace pronouns and partial names with full canonical forms ("He said" → "M. Hamel said") before the graph transformer ever sees it. This is the only tier that handles alias disambiguation because it requires reading context. Tier 3 is post-ingestion APOC Jaro-Winkler merge — after writing to Neo4j, entity node pairs with similarity above 0.92 are merged via `apoc.refactor.mergeNodes`, folding formatting variants ("M Hamel" + "M. Hamel") into a single canonical node while preserving all relationships. Threshold 0.92 catches spacing and punctuation variants without merging distinct entities like "M. Hamel" and "C. Hamel" (score ~0.81).
+
+**Semantic chunking for graph ingestion** — `ingest_graph_watch.py` uses `SemanticChunker` instead of `RecursiveCharacterTextSplitter`. SemanticChunker embeds every sentence and splits where cosine similarity between adjacent sentences drops below the 85th percentile, producing chunks that are complete thoughts rather than arbitrary token windows. This directly improves entity extraction quality because `LLMGraphTransformer` reads one chunk at a time — a split mid-idea means the LLM sees incomplete context and may extract wrong relationships from both halves. `ingest_vector_watch.py` continues using fixed token chunking because for pure vector search, consistent chunk sizes with overlap are fine.
+
+**Graceful degradation** — if Neo4j is unavailable at startup, `GraphService` init fails and `graph_service` is set to `None`. `RetrieveService` detects this and falls back to FAISS-only retrieval for both vector search and graph context. The system continues working without Neo4j — it just loses the hybrid BM25+dense vector advantage and all entity relationship context until Neo4j comes back.
+
+**Lifespan context manager** — service initialisation and teardown use the FastAPI `lifespan` async context manager, not the deprecated `on_event` hooks. All services with a `close()` method are shut down cleanly on container stop.
+
+**Thread-safe memory** — `MemoryService` uses `threading.RLock()` for safe concurrent access across FastAPI worker threads, with SQLite in WAL mode for durable persistence.
+
+**Semantic cache bypass** — the cache is skipped when `mode=detailed`, `temperature > 0.1`, `max_tokens` exceeds the default, or `bypass_cache=True`. Without these conditions, action buttons requesting detailed or creative responses would silently return the same cached concise answer regardless of the parameters sent.
+
+---
+
+## Configuration
+
+All settings are in `.env` and mapped through `backend/core/config.py` via Pydantic Settings. Key parameters:
+
+| Setting | Default | Notes |
+|---|---|---|
+| `OLLAMA_MODEL` | `qwen2.5:7b` | Generation model |
+| `MAX_TOKENS` | `1024` | Generation token budget |
+| `MAX_ITERATIONS` | `7` | Max Transform Query retries |
+| `TOP_K_RETRIEVAL` | `5` | Documents returned after reranking |
+| `RERANKER_INITIAL_K` | `15` | Candidates fetched before reranking |
+| `SEMANTIC_CACHE_THRESHOLD` | `0.85` | Cosine similarity cutoff for cache hits |
+| `USE_HYDE` | `true` | Enable HyDE query expansion |
+| `SEMANTIC_CHUNK_BREAKPOINT` | `85` | Percentile threshold for semantic chunking splits |
+| `SEMANTIC_CHUNK_THRESHOLD_TYPE` | `percentile` | SemanticChunker breakpoint type |
+| `USE_COREF` | `true` | Enable LLM coreference resolution during graph ingestion |
+
+---
 
 ## Future Improvements
 
-1. **Graph Community Detection:** Implement hierarchical community clustering (similar to Microsoft's GraphRAG approach) to enable global map-reduce summarization capabilities for broad questions like "What is the overall theme of the dataset?".
-2. **Async Database Drivers:** Migrate Neo4j and SQLite connections to fully asynchronous drivers (`neo4j.AsyncGraphDatabase` and `aiosqlite`) to maximize FastAPIs event loop efficiency under heavy concurrent load.
-3. **Multi-Tenant Architecture:** Expand the SQLite memory and Vector stores to include explicit `user_id` and `tenant_id` partitioning for SaaS deployment scalability.
-4. **Dynamic Chunking Strategies:** Transition from static token overlap chunking to semantic chunking (splitting on proposition or embedding shift boundaries) to preserve context integrity during vectorization.
+- **Graph Community Detection** — implement hierarchical community clustering (similar to Microsoft's GraphRAG) to enable global map-reduce summarisation for broad thematic questions.
+- **Async database drivers** — migrate Neo4j and SQLite connections to `neo4j.AsyncGraphDatabase` and `aiosqlite` to maximise FastAPI's event loop efficiency under concurrent load.
+- **Evaluation framework** — integrate RAGAS scores to measure retrieval precision and answer faithfulness programmatically rather than by observation.
+- **Faster coreference resolution** — replace the LLM coreference pass with a dedicated lightweight model (FastCoref, NeuralCoref) to reduce ingestion time on large corpora without sacrificing entity disambiguation accuracy.
+
+---
 
 ## Author
 
-**Shreyash Gaur** Gen AI & Machine Learning Engineer
-
-[LinkedIn](https://www.google.com/search?q=https://www.linkedin.com/in/shreyashgaur/) | shreyashgaur221@gmail.com / shreyashgaur01@gmail.com
+**Shreyash Gaur** — AI Engineer
