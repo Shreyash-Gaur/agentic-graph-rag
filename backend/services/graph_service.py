@@ -175,34 +175,56 @@ class GraphService:
 
         Returns the number of duplicate pairs found and merged.
         """
+        # Step 0: fix any nodes whose id became a StringArray from a previous
+        # merge run that used properties:'combine'. This query finds nodes
+        # where id is a list and converts them back to their longest string.
+        # Uses valueType() — built into Neo4j 5.x, no APOC needed.
+        cleanup_query = """
+        MATCH (n:__Entity__)
+        WHERE n.id IS NOT NULL
+          AND valueType(n.id) STARTS WITH 'LIST'
+        WITH n,
+             reduce(longest = '', x IN n.id |
+                 CASE WHEN size(toString(x)) > size(longest)
+                      THEN toString(x) ELSE longest END
+             ) AS canonical_id
+        SET n.id = canonical_id
+        RETURN count(n) AS fixed
+        """
+
+        # Uses elementId() — id() is deprecated in Neo4j 5.x.
+        # Uses valueType() guard to skip any remaining StringArray nodes
+        # rather than letting toLower() throw TypeError on them.
         find_query = """
         MATCH (a:__Entity__), (b:__Entity__)
-        WHERE id(a) < id(b)
+        WHERE elementId(a) < elementId(b)
           AND a.id IS NOT NULL
           AND b.id IS NOT NULL
+          AND valueType(a.id) = 'STRING NOT NULL'
+          AND valueType(b.id) = 'STRING NOT NULL'
           AND apoc.text.jaroWinklerDistance(toLower(a.id), toLower(b.id)) > 0.92
         RETURN
-            id(a) AS id_a,
-            id(b) AS id_b,
-            a.id  AS name_a,
-            b.id  AS name_b,
+            elementId(a) AS eid_a,
+            elementId(b) AS eid_b,
+            a.id          AS name_a,
+            b.id          AS name_b,
             apoc.text.jaroWinklerDistance(toLower(a.id), toLower(b.id)) AS score
         ORDER BY score DESC
         """
 
-        # Keep the longer (more specific) name as canonical,
-        # fold the shorter (partial) name into it, preserve all relationships
-        merge_query = """
+        # FIX: properties:'overwrite' keeps the canonical node's id as a plain
+        # string. 'combine' was merging id values into StringArray which then
+        # broke subsequent toLower() calls on those nodes.
+        # FIX: merge one pair at a time — bulk merge caused "Node not found"
+        # when a node was deleted mid-transaction by an earlier pair in the set.
+        merge_one_query = """
         MATCH (a:__Entity__), (b:__Entity__)
-        WHERE id(a) < id(b)
-          AND a.id IS NOT NULL
-          AND b.id IS NOT NULL
-          AND apoc.text.jaroWinklerDistance(toLower(a.id), toLower(b.id)) > 0.92
+        WHERE elementId(a) = $eid_a AND elementId(b) = $eid_b
         WITH
             CASE WHEN size(a.id) >= size(b.id) THEN a ELSE b END AS canonical,
             CASE WHEN size(a.id) >= size(b.id) THEN b ELSE a END AS duplicate
         CALL apoc.refactor.mergeNodes([canonical, duplicate], {
-            properties: 'combine',
+            properties: 'overwrite',
             mergeRels:  true
         })
         YIELD node
@@ -210,21 +232,43 @@ class GraphService:
         """
 
         try:
+            # Run cleanup first to fix any StringArray ids from previous runs
+            try:
+                result = self.graph.query(cleanup_query)
+                fixed = result[0].get("fixed", 0) if result else 0
+                if fixed > 0:
+                    logger.info("Fixed %d entity node(s) with StringArray id — converted to string", fixed)
+            except Exception as e:
+                logger.debug("StringArray cleanup skipped (no arrays found or APOC not ready): %s", e)
+
             candidates = self.graph.query(find_query)
             if not candidates:
                 logger.info("No duplicate entity pairs found — graph is clean")
                 return 0
 
             logger.info("Found %d duplicate entity pair(s) — merging:", len(candidates))
+            merged_count = 0
+
             for row in candidates:
                 logger.info(
                     "  '%s' + '%s' (score=%.3f)",
                     row["name_a"], row["name_b"], row["score"],
                 )
+                try:
+                    self.graph.query(
+                        merge_one_query,
+                        {"eid_a": row["eid_a"], "eid_b": row["eid_b"]},
+                    )
+                    merged_count += 1
+                except Exception as e:
+                    # Node may have already been merged by a previous iteration
+                    logger.debug(
+                        "Skipping pair ('%s', '%s') — likely already merged: %s",
+                        row["name_a"], row["name_b"], e,
+                    )
 
-            self.graph.query(merge_query)
-            logger.info("Entity merge complete — %d pair(s) merged", len(candidates))
-            return len(candidates)
+            logger.info("Entity merge complete — %d pair(s) merged", merged_count)
+            return merged_count
 
         except Exception as e:
             logger.error("Entity merge failed (is APOC installed?): %s", e)
