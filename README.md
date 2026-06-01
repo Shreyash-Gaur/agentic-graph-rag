@@ -188,9 +188,11 @@ Start the application:
 ```bash
 # Backend
 uvicorn backend.main:APP --host 0.0.0.0 --port 8000
+or
+python -m uvicorn backend.main:APP --host 0.0.0.0 --port 8000 --reload
 
 # Frontend (separate terminal)
-chainlit run frontend/chainlit_app.py -w --port 8001
+chainlit run frontend/chainlit_app.py --port 8001
 ```
 
 Drop PDF or TXT files into the `knowledge/` directory. Both watchers will detect new files and ingest them into their respective stores automatically.
